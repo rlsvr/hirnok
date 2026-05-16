@@ -1,0 +1,83 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/rlsvr/hirnok
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+    - unused
+    - misspell
+    - nolintlint
+    - prealloc
+    - unconvert
+    - unparam
+    - bodyclose
+    - copyloopvar
+    - errname
+    - errorlint
+    - goconst
+    - gocyclo
+    - gosec
+    - mirror
+    - nestif
+    - nilerr
+    - noctx
+    - nonamedreturns
+    - reassign
+    - rowserrcheck
+    - sqlclosecheck
+    - testifylint
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+    - zerologlint
+  settings:
+    revive:
+      rules:
+        - name: redefines-builtin-id
+        - name: var-naming
+          arguments: [["ID"], ["HTTP", "URL", "API"]]
+        - name: dot-imports
+        - name: import-shadowing
+        - name: error-strings
+        - name: error-return
+        - name: indent-error-flow
+        - name: if-return
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: time-naming
+        - name: unexported-return
+        - name: unused-parameter
+        - name: unused-receiver
+        - name: string-of-int
+        - name: atomic
+        - name: string-format
+          arguments:
+            - - errors.New[0],fmt.Errorf[0]
+              - '!/^.*(?:failed|error).*$/'
+              - error messages must not contain 'failed' or 'error'
+        - name: struct-tag
+        - name: empty-block
+        - name: superfluous-else
+        - name: confusing-naming
+
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
