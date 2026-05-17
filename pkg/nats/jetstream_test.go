@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -440,6 +441,69 @@ func TestConsumerWaitAfterStop(t *testing.T) {
 	defer cancel()
 	if err := cons.Wait(ctx); err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+}
+
+func TestErrTerminateAckedOnJS(t *testing.T) {
+	assertSentinelAcked(t, func() error {
+		return fmt.Errorf("bad payload: %w", ErrTerminate)
+	}, "S_TERM", "s_term.>", "c_term")
+}
+
+func TestErrSkipAckedOnJS(t *testing.T) {
+	assertSentinelAcked(t, func() error { return ErrSkip }, "S_SKIP", "s_skip.>", "c_skip")
+}
+
+// assertSentinelAcked publishes a single message, runs a handler that
+// returns the given sentinel error, and verifies the message is acked
+// (i.e. not redelivered) — handler called exactly once, no pending.
+func assertSentinelAcked(t *testing.T, returnErr func() error, stream, subjectPattern, consumer string) {
+	t.Helper()
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, stream, subjectPattern)
+
+	subj := strings.TrimSuffix(subjectPattern, ".>") + ".x"
+	if _, err := j.Publish(context.Background(), subj, []byte("x")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	var calls atomic.Int32
+	cons, err := j.Consume(context.Background(), stream, jetstream.ConsumerConfig{
+		Durable:       consumer,
+		FilterSubject: subjectPattern,
+		AckWait:       2 * time.Second,
+	}, func(_ context.Context, _ *JetMessage) error {
+		calls.Add(1)
+		return returnErr()
+	})
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	defer cons.Stop()
+
+	// Wait long enough that, if Nak'd, the server would have redelivered.
+	time.Sleep(300 * time.Millisecond)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler called %d times, want 1 (sentinel should ack, not redeliver)", got)
+	}
+
+	stream2, err := j.Raw().Stream(context.Background(), stream)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	consInfo, err := stream2.Consumer(context.Background(), consumer)
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+	info, err := consInfo.Info(context.Background())
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	if info.NumAckPending != 0 || info.NumPending != 0 {
+		t.Fatalf("ackPending=%d pending=%d, want 0/0", info.NumAckPending, info.NumPending)
 	}
 }
 

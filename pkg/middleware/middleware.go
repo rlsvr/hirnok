@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/sethvargo/go-retry"
+
+	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // Recover wraps h so panics in the handler become errors instead of
@@ -90,5 +92,8 @@ func Retry[M any](
 }
 
 func defaultShouldRetry(err error) bool {
+	if errors.Is(err, qpnats.ErrTerminate) || errors.Is(err, qpnats.ErrSkip) {
+		return false
+	}
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }

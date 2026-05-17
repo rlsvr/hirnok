@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -156,6 +157,38 @@ func TestRetryDefaultIgnoresDeadlineExceeded(t *testing.T) {
 	err := h(context.Background(), 0)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls = %d, want 1", got)
+	}
+}
+
+func TestRetryDefaultSkipsErrTerminate(t *testing.T) {
+	var calls atomic.Int32
+	h := Retry(func(_ context.Context, _ int) error {
+		calls.Add(1)
+		return fmt.Errorf("bad payload: %w", qpnats.ErrTerminate)
+	}, 5, time.Millisecond, 0, nil)
+
+	err := h(context.Background(), 0)
+	if !errors.Is(err, qpnats.ErrTerminate) {
+		t.Fatalf("err = %v, want ErrTerminate", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls = %d, want 1 (terminate must short-circuit retry)", got)
+	}
+}
+
+func TestRetryDefaultSkipsErrSkip(t *testing.T) {
+	var calls atomic.Int32
+	h := Retry(func(_ context.Context, _ int) error {
+		calls.Add(1)
+		return qpnats.ErrSkip
+	}, 5, time.Millisecond, 0, nil)
+
+	err := h(context.Background(), 0)
+	if !errors.Is(err, qpnats.ErrSkip) {
+		t.Fatalf("err = %v, want ErrSkip", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("calls = %d, want 1", got)

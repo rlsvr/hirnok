@@ -124,10 +124,15 @@ func dispatchJet(parent context.Context, h JetHandler, m *JetMessage, timeout ti
 		// AckWait elapsed mid-handler (or parent canceled). Server has
 		// redelivered or will. Don't Ack (it'd be a no-op); don't Nak
 		// (would shorten the redelivery cycle for no reason).
-	case err != nil:
-		_ = m.Nak()
-	default:
+	case err == nil:
 		_ = m.Ack()
+	case errors.Is(err, ErrSkip), errors.Is(err, ErrTerminate):
+		// Explicit "don't redeliver" signal from the handler — ack so
+		// the server stops trying. Pair ErrTerminate with DLQ middleware
+		// to capture the payload before it's lost.
+		_ = m.Ack()
+	default:
+		_ = m.Nak()
 	}
 }
 

@@ -192,24 +192,56 @@ if err := conn.PublishMsg(&qpnats.Message{Msg: m}); err != nil {
 }
 ```
 
-### Dead-letter pattern
+### Sentinel errors
 
-There's no built-in DLQ middleware because the target subject and the "is this terminal?" decision vary too much. Here's the pattern in ~10 lines — copy and adapt:
+Two sentinels in `pkg/nats` give handlers a shared vocabulary for "don't redeliver this":
+
+- **`nats.ErrTerminate`** — handler failed permanently; don't retry, send to DLQ. The JetStream dispatcher acks (no more redelivery). The default `Retry` shouldRetry skips it. The default `DLQ` shouldDLQ matches it. Wrap a domain error to surface a useful reason in DLQ headers:
+  ```go
+  return fmt.Errorf("bad payload: %w", nats.ErrTerminate)
+  ```
+
+- **`nats.ErrSkip`** — handler decided the message is irrelevant; ack and drop silently. No retry, no DLQ. JetStream acks; DLQ short-circuits without publishing.
+
+Sentinel-aware components see them via `errors.Is`, so callers can wrap them with their own domain errors and everything still works.
+
+### DLQ (dead-letter queue)
+
+`DLQ` (core) and `DLQJet` (JetStream) wrap a handler so failed messages get republished to a dead-letter subject with diagnostic headers attached:
+
+| Header | Value |
+|---|---|
+| `Hirnok-DLQ-Reason` | `err.Error()` |
+| `Hirnok-DLQ-Subject` | original subject |
+| `Hirnok-DLQ-At` | RFC3339 timestamp |
+
+Original headers (traceparent, custom metadata) are preserved. The wrapped handler returns nil on a successful DLQ publish so the caller acks the original message.
 
 ```go
-func DLQ(h qpnats.Handler, publisher *qpnats.Conn, subject string, isTerminal func(error) bool) qpnats.Handler {
-    return func(ctx context.Context, m *qpnats.Message) error {
-        err := h(ctx, m)
-        if err != nil && isTerminal(err) {
-            _ = publisher.Publish(subject, m.Data)
-            return nil // swallow — message is in DLQ, not in our hot path
-        }
-        return err
-    }
-}
+// Plain: every error → DLQ after retries exhaust
+h := qpmw.DLQJet(qpmw.RetryJet(myHandler, 3, 100*time.Millisecond, 5*time.Second, nil),
+    js, "events.dlq", nil)
+
+// Filtered: only specific errors go to DLQ
+isSchemaError := func(err error) bool { return errors.Is(err, ErrSchema) }
+h := qpmw.DLQJet(myHandler, js, "schema.dlq", isSchemaError)
+
+// Terminate-bypass-retry: handler signals "don't retry, just DLQ"
+//   in handler:   return fmt.Errorf("bad: %w", nats.ErrTerminate)
+//   in wiring:
+h := qpmw.RetryJet(qpmw.DLQJet(myHandler, js, "events.dlq", nil), 3, ...)
+//   Retry's default shouldRetry skips ErrTerminate; DLQJet publishes
+//   and returns nil; Retry sees nil and doesn't loop.
 ```
 
-Put `DLQ` *inside* `Retry` (so retries happen first, only the final terminal error goes to DLQ) or *outside* (so the DLQ predicate decides per-attempt) depending on what you want.
+Default `shouldDLQ` routes everything to DLQ *except* `ErrSkip`, `context.Canceled`, and `context.DeadlineExceeded` — those indicate "try again later," not "the data is poison."
+
+If the DLQ publish itself fails, the wrapper returns a joined error (original + publish error) so the outer redelivery path can retry. For JetStream DLQs, make sure the DLQ subject is covered by a stream of its own so DLQ messages are durable.
+
+### Composition: DLQ inside vs outside Retry
+
+- **Outside** (`DLQ(Retry(h))`): only the *final* post-retry failure is DLQ'd. Use when retries are worth trying first.
+- **Inside** (`Retry(DLQ(h))`): each failed attempt is DLQ'd — but DLQ swallows the error so Retry sees nil and doesn't loop. Use for fast-fail patterns where retries are pointless (e.g., handler returns `ErrTerminate`).
 
 ### Wiring multiple handlers
 
