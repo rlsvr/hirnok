@@ -25,11 +25,12 @@ Requires Go 1.26+.
 
 ## Packages
 
-| Path         | What it is                                                          |
-|--------------|---------------------------------------------------------------------|
-| `pkg/queue`  | Bounded generic FIFO `Queue[T]` — the building block.                |
-| `pkg/worker` | Generic worker pool that drains a `Queue[T]` into a dispatch func.   |
-| `pkg/nats`   | NATS connection + subscribe/publish + JetStream consumer/publisher. |
+| Path             | What it is                                                          |
+|------------------|---------------------------------------------------------------------|
+| `pkg/queue`      | Bounded generic FIFO `Queue[T]` — the building block.                |
+| `pkg/worker`     | Generic worker pool that drains a `Queue[T]` into a dispatch func.   |
+| `pkg/nats`       | NATS connection + subscribe/publish + JetStream consumer/publisher. |
+| `pkg/middleware` | Composable handler decorators: `Recover`, `Retry`, `Trace`, `TraceJet`. |
 
 `pkg/queue` and `pkg/worker` are usable on their own — you don't need NATS to get value out of them. Example:
 
@@ -128,6 +129,129 @@ For core NATS there's no AckWait, so the handler `ctx` is the parent subscriptio
 ## Concurrency
 
 `Config.Workers` sets the per-subscription worker count. Each subscription owns a bounded `pkg/queue` and that many goroutines drain it concurrently. Use `Workers: 1` for strict serial processing; higher values fan out at the cost of FIFO completion order.
+
+## Middleware
+
+Handlers are functions, so "middleware" is just `func(Handler) Handler`. `pkg/middleware` provides composable decorators — compose by nesting or assigning, no framework needed.
+
+```go
+import qpmw "github.com/rlsvr/hirnok/pkg/middleware"
+
+h := qpmw.Recover(
+    qpmw.Retry(myHandler, 3, 100*time.Millisecond, 5*time.Second, nil),
+)
+conn.Subscribe(ctx, "foo", h)
+```
+
+Or imperatively when you have more than two layers:
+
+```go
+h := myHandler
+h = qpmw.Recover(h)
+h = qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, nil)
+h = qpmw.Trace(h, tracer)
+```
+
+**`Recover`** catches panics in the handler and returns them as errors so a misbehaving handler doesn't take down the worker goroutine.
+
+**`Retry`** retries on error with exponential backoff capped at `maxBackoff`. The `shouldRetry` filter decides which errors are retryable; pass `nil` for the default (retry everything except `context.Canceled` / `context.DeadlineExceeded`). Backoff sleeps respect ctx, so on JetStream the retry exits cleanly when the handler's AckWait-derived ctx expires. Note: put `Recover` *inside* `Retry` if you want panics to trigger retries — `Retry` only sees errors, not panics.
+
+`Recover` and `Retry` are generic — they work with `qpnats.Handler`, `qpnats.JetHandler`, or any function of shape `func(context.Context, M) error`. Go infers the message type from the handler you pass in.
+
+### Tracing (OpenTelemetry)
+
+`Trace` / `TraceJet` wrap a handler with a `hirnok.handle` OTel span. They:
+
+- extract the upstream W3C `traceparent`/`tracestate` from `msg.Header` so the new span continues the caller's trace;
+- attach `messaging.*` semconv attributes (`system=nats`, `destination`, `operation=process`, `message.id`, `body.size`);
+- record handler errors as span errors;
+- make the span available to the handler via `ctx` — call `trace.SpanFromContext(ctx)` to add your own attributes.
+
+```go
+import (
+    qpmw "github.com/rlsvr/hirnok/pkg/middleware"
+    "go.opentelemetry.io/otel"
+)
+
+tracer := otel.Tracer("my-service")
+h := qpmw.Recover(qpmw.Trace(myHandler, tracer))
+conn.Subscribe(ctx, "events.*", h)
+```
+
+For publish-side tracing, inject the current ctx into outgoing headers yourself — five lines, no wrapper type needed:
+
+```go
+import "go.opentelemetry.io/otel/codes"
+
+m := &nats.Msg{Subject: "events.user.signup", Data: payload, Header: nats.Header{}}
+ctx, span := tracer.Start(ctx, "hirnok.publish")
+defer span.End()
+otel.GetTextMapPropagator().Inject(ctx, qpmw.HeaderCarrier{Header: m.Header})
+if err := conn.PublishMsg(&qpnats.Message{Msg: m}); err != nil {
+    span.RecordError(err); span.SetStatus(codes.Error, err.Error())
+}
+```
+
+### Dead-letter pattern
+
+There's no built-in DLQ middleware because the target subject and the "is this terminal?" decision vary too much. Here's the pattern in ~10 lines — copy and adapt:
+
+```go
+func DLQ(h qpnats.Handler, publisher *qpnats.Conn, subject string, isTerminal func(error) bool) qpnats.Handler {
+    return func(ctx context.Context, m *qpnats.Message) error {
+        err := h(ctx, m)
+        if err != nil && isTerminal(err) {
+            _ = publisher.Publish(subject, m.Data)
+            return nil // swallow — message is in DLQ, not in our hot path
+        }
+        return err
+    }
+}
+```
+
+Put `DLQ` *inside* `Retry` (so retries happen first, only the final terminal error goes to DLQ) or *outside* (so the DLQ predicate decides per-attempt) depending on what you want.
+
+### Wiring multiple handlers
+
+There's no `Router` in hirnok on purpose. If you want one central place to register handlers, apply a default middleware chain, and shut everything down together, that's about 25 lines of caller code:
+
+```go
+type Setup struct {
+    Conn   *qpnats.Conn
+    Tracer trace.Tracer
+    subs   []*qpnats.Sub
+}
+
+func (s *Setup) wrap(h qpnats.Handler) qpnats.Handler {
+    h = qpmw.Trace(h, s.Tracer)
+    h = qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, nil)
+    h = qpmw.Recover(h)
+    return h
+}
+
+func (s *Setup) Sub(ctx context.Context, subject string, h qpnats.Handler) error {
+    sub, err := s.Conn.Subscribe(ctx, subject, s.wrap(h))
+    if err != nil {
+        return err
+    }
+    s.subs = append(s.subs, sub)
+    return nil
+}
+
+func (s *Setup) Stop(ctx context.Context) error {
+    for _, sub := range s.subs {
+        _ = sub.Unsubscribe()
+    }
+    for _, sub := range s.subs {
+        if err := sub.Wait(ctx); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+Same idea works for JetStream — add a `JS *qpnats.JetStream` field, a parallel `Consume` method, and track `[]*qpnats.Consumer`. The point is: this is *your* glue, shaped to *your* app. We don't impose a Router on you.
 
 ## Development
 
