@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
@@ -60,12 +61,12 @@ func run() error {
 
 func coreRoundTrip(conn *qpnats.Conn) error {
 	const total = 20
-	received := make(chan *qpnats.Message, total)
+	received := make(chan *natsio.Msg, total)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	sub, err := conn.Subscribe(ctx, "smoke.core.*", func(_ context.Context, m *qpnats.Message) error {
+	sub, err := conn.Subscribe(ctx, "smoke.core.*", func(_ context.Context, m *natsio.Msg) error {
 		received <- m
 		return nil
 	})
@@ -129,11 +130,11 @@ func jetRoundTrip(conn *qpnats.Conn) error {
 	}
 
 	var seen atomic.Int32
-	cons, err := js.Consume(ctx, "SMOKE", jetstream.ConsumerConfig{
+	cons, err := js.NewConsumer(ctx, "SMOKE", jetstream.ConsumerConfig{
 		Durable:       "smoke-consumer",
 		FilterSubject: "smoke.js.>",
 		AckWait:       5 * time.Second,
-	}, func(_ context.Context, _ *qpnats.JetMessage) error {
+	}, func(_ context.Context, _ jetstream.Msg) error {
 		seen.Add(1)
 		return nil
 	})

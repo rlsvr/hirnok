@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	natsio "github.com/nats-io/nats.go"
+
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
@@ -51,7 +53,7 @@ func run(url string, workers, queueSize int, handlerDelay, duration, shutdownGra
 	var processed atomic.Int64
 	var ctxCanceledHandlers atomic.Int64
 
-	sub, err := conn.Subscribe(context.Background(), "stress.bp", func(ctx context.Context, _ *qpnats.Message) error {
+	sub, err := conn.Subscribe(context.Background(), "stress.bp", func(ctx context.Context, _ *natsio.Msg) error {
 		select {
 		case <-time.After(handlerDelay):
 			processed.Add(1)

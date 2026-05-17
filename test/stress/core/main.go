@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	natsio "github.com/nats-io/nats.go"
+
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
@@ -53,7 +55,7 @@ func run(url string, producers, workers, total, queueSize, payloadSize int) erro
 	}
 
 	var received atomic.Int64
-	sub, err := conn.Subscribe(context.Background(), "stress.core", func(_ context.Context, _ *qpnats.Message) error {
+	sub, err := conn.Subscribe(context.Background(), "stress.core", func(_ context.Context, _ *natsio.Msg) error {
 		received.Add(1)
 		return nil
 	})

@@ -1,10 +1,11 @@
-package middleware
+package otel
 
 import (
 	"context"
 
 	natsio "github.com/nats-io/nats.go"
-	"go.opentelemetry.io/otel"
+	"github.com/nats-io/nats.go/jetstream"
+	otelapi "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
@@ -31,19 +32,19 @@ const (
 // and threaded into the handler. Handler errors are recorded on the
 // span (RecordError + Error status).
 func Trace(h qpnats.Handler, tracer trace.Tracer) qpnats.Handler {
-	return func(ctx context.Context, m *qpnats.Message) error {
+	return func(ctx context.Context, m *natsio.Msg) error {
 		var header natsio.Header
-		if m != nil && m.Msg != nil {
+		if m != nil {
 			header = m.Header
 		}
 
-		parent := otel.GetTextMapPropagator().Extract(ctx, HeaderCarrier{Header: header})
+		parent := otelapi.GetTextMapPropagator().Extract(ctx, HeaderCarrier{Header: header})
 		spanCtx, span := tracer.Start(parent, spanNameHandle)
 		defer span.End()
 
 		subject := ""
 		var bodySize int
-		if m != nil && m.Msg != nil {
+		if m != nil {
 			subject = m.Subject
 			bodySize = len(m.Data)
 		}
@@ -60,19 +61,19 @@ func Trace(h qpnats.Handler, tracer trace.Tracer) qpnats.Handler {
 
 // TraceJet is the JetStream equivalent of Trace.
 func TraceJet(h qpnats.JetHandler, tracer trace.Tracer) qpnats.JetHandler {
-	return func(ctx context.Context, m *qpnats.JetMessage) error {
+	return func(ctx context.Context, m jetstream.Msg) error {
 		var header natsio.Header
-		if m != nil && m.Msg != nil {
+		if m != nil {
 			header = m.Headers()
 		}
 
-		parent := otel.GetTextMapPropagator().Extract(ctx, HeaderCarrier{Header: header})
+		parent := otelapi.GetTextMapPropagator().Extract(ctx, HeaderCarrier{Header: header})
 		spanCtx, span := tracer.Start(parent, spanNameHandle)
 		defer span.End()
 
 		subject := ""
 		var bodySize int
-		if m != nil && m.Msg != nil {
+		if m != nil {
 			subject = m.Subject()
 			bodySize = len(m.Data())
 		}

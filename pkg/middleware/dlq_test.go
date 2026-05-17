@@ -69,11 +69,11 @@ func TestDLQPublishesOnError(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.go")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error {
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
 		return errors.New("boom")
 	}, c, "dlq.go", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "orig.x", Data: []byte("payload"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "orig.x", Data: []byte("payload"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil after DLQ", err)
 	}
@@ -93,11 +93,11 @@ func TestDLQAddsHeaders(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.hdr")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error {
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
 		return errors.New("bad")
 	}, c, "dlq.hdr", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "orig.x", Data: []byte("p"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "orig.x", Data: []byte("p"), Header: natsio.Header{}}
 	_ = h(context.Background(), m)
 
 	select {
@@ -123,13 +123,13 @@ func TestDLQPreservesOriginalHeaders(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.preserve")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return errors.New("x") },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return errors.New("x") },
 		c, "dlq.preserve", nil)
 
 	hdr := natsio.Header{}
 	hdr.Set("traceparent", "00-trace-span-01")
 	hdr.Set("X-Custom", "keep-me")
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: hdr}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: hdr}
 	_ = h(context.Background(), m)
 
 	select {
@@ -150,10 +150,10 @@ func TestDLQPassThroughOnNil(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.ok")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return nil },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return nil },
 		c, "dlq.ok", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -169,10 +169,10 @@ func TestDLQErrSkipShortCircuits(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.skip")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return qpnats.ErrSkip },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return qpnats.ErrSkip },
 		c, "dlq.skip", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -189,10 +189,10 @@ func TestDLQShouldDLQFalse(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.false")
 
 	sentinel := errors.New("transient")
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return sentinel },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return sentinel },
 		c, "dlq.false", func(_ error) bool { return false })
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want sentinel (should bubble up)", err)
 	}
@@ -208,10 +208,10 @@ func TestDLQDefaultSkipsCtxCanceled(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.cancel")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return context.Canceled },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return context.Canceled },
 		c, "dlq.cancel", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -227,10 +227,10 @@ func TestDLQDefaultSkipsCtxDeadline(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.deadline")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return context.DeadlineExceeded },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return context.DeadlineExceeded },
 		c, "dlq.deadline", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
@@ -246,11 +246,11 @@ func TestDLQErrTerminateIsDLQd(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.term")
 
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error {
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
 		return fmt.Errorf("bad: %w", qpnats.ErrTerminate)
 	}, c, "dlq.term", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil", err)
 	}
@@ -273,10 +273,10 @@ func TestDLQPublishFailureReturnsJoined(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // let Drain settle
 
 	handlerErr := errors.New("original")
-	h := DLQ(func(_ context.Context, _ *qpnats.Message) error { return handlerErr },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return handlerErr },
 		c, "dlq.broken", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	err := h(context.Background(), m)
 	if err == nil {
 		t.Fatal("expected error when DLQ publish fails")
@@ -286,13 +286,27 @@ func TestDLQPublishFailureReturnsJoined(t *testing.T) {
 	}
 }
 
+func TestDLQPublishFailureStripsErrTerminate(t *testing.T) {
+	err := dlqPublishError(
+		fmt.Errorf("bad payload: %w", qpnats.ErrTerminate),
+		"dlq.term",
+		errors.New("publish failed"),
+	)
+	if errors.Is(err, qpnats.ErrTerminate) {
+		t.Fatalf("publish failure error should not preserve ErrTerminate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "terminate") {
+		t.Fatalf("error should keep handler context text, got %v", err)
+	}
+}
+
 func TestDLQPanicsOnNilConn(t *testing.T) {
 	defer func() {
 		if recover() == nil {
 			t.Fatal("expected panic for nil conn")
 		}
 	}()
-	_ = DLQ(func(_ context.Context, _ *qpnats.Message) error { return nil }, nil, "x", nil)
+	_ = DLQ(func(_ context.Context, _ *natsio.Msg) error { return nil }, nil, "x", nil)
 }
 
 func TestDLQPanicsOnEmptySubject(t *testing.T) {
@@ -303,7 +317,7 @@ func TestDLQPanicsOnEmptySubject(t *testing.T) {
 			t.Fatal("expected panic for empty subject")
 		}
 	}()
-	_ = DLQ(func(_ context.Context, _ *qpnats.Message) error { return nil }, c, "", nil)
+	_ = DLQ(func(_ context.Context, _ *natsio.Msg) error { return nil }, c, "", nil)
 }
 
 // ---------------- DLQJet ----------------
@@ -324,18 +338,18 @@ func TestDLQJetPublishesOnError(t *testing.T) {
 	}
 	dlq := captureDLQ(t, c, "dlq.js.x")
 
-	h := DLQJet(func(_ context.Context, _ *qpnats.JetMessage) error {
+	h := DLQJet(func(_ context.Context, _ jetstream.Msg) error {
 		return fmt.Errorf("unprocessable: %w", qpnats.ErrTerminate)
 	}, j, "dlq.js.x", nil)
 
-	// Build a stub JetMessage with everything DLQ needs.
+	// Build a stub jetstream.Msg with everything DLQ needs.
 	hdr := natsio.Header{}
 	hdr.Set("traceparent", "00-trace-01")
-	jm := &qpnats.JetMessage{Msg: &dlqJetStub{
+	jm := &dlqJetStub{
 		subject: "orders.new",
 		data:    []byte("ord-1"),
 		headers: hdr,
-	}}
+	}
 
 	if err := h(context.Background(), jm); err != nil {
 		t.Fatalf("wrapper err = %v, want nil", err)
@@ -381,13 +395,13 @@ func TestRetryThenDLQ(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.retried")
 
 	var calls atomic.Int32
-	inner := func(_ context.Context, _ *qpnats.Message) error {
+	inner := func(_ context.Context, _ *natsio.Msg) error {
 		calls.Add(1)
 		return errors.New("transient")
 	}
 	h := DLQ(Retry(inner, 3, time.Millisecond, 0, nil), c, "dlq.retried", nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil", err)
 	}
@@ -410,13 +424,13 @@ func TestDLQInsideRetry(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.swallow")
 
 	var calls atomic.Int32
-	inner := func(_ context.Context, _ *qpnats.Message) error {
+	inner := func(_ context.Context, _ *natsio.Msg) error {
 		calls.Add(1)
 		return errors.New("transient")
 	}
 	h := Retry(DLQ(inner, c, "dlq.swallow", nil), 5, time.Millisecond, 0, nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil", err)
 	}
@@ -439,13 +453,13 @@ func TestErrTerminateBypassesRetry(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.terminate")
 
 	var calls atomic.Int32
-	inner := func(_ context.Context, _ *qpnats.Message) error {
+	inner := func(_ context.Context, _ *natsio.Msg) error {
 		calls.Add(1)
 		return fmt.Errorf("bad payload: %w", qpnats.ErrTerminate)
 	}
 	h := Retry(DLQ(inner, c, "dlq.terminate", nil), 5, time.Millisecond, 0, nil)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil", err)
 	}

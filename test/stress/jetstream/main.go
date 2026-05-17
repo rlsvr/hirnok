@@ -102,11 +102,11 @@ func run(url string, workers, total, queueSize, payloadSize int, ackWait time.Du
 
 	var received atomic.Int64
 	conStart := time.Now()
-	cons, err := js.Consume(ctx, streamName, jetstream.ConsumerConfig{
+	cons, err := js.NewConsumer(ctx, streamName, jetstream.ConsumerConfig{
 		Durable:       "stress-consumer",
 		FilterSubject: subject,
 		AckWait:       ackWait,
-	}, func(_ context.Context, _ *qpnats.JetMessage) error {
+	}, func(_ context.Context, _ jetstream.Msg) error {
 		received.Add(1)
 		return nil
 	})

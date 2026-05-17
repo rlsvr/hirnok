@@ -1,6 +1,6 @@
 module github.com/rlsvr/hirnok
 
-go 1.26.1
+go 1.25.0
 
 require (
 	github.com/nats-io/nats-server/v2 v2.14.0

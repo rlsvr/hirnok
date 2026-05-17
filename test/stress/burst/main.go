@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	natsio "github.com/nats-io/nats.go"
+
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
@@ -50,7 +52,7 @@ func run(url string, workers, queueSize, burst int, idle time.Duration, payloadS
 	var received atomic.Int64
 	var firstAt atomic.Int64
 
-	sub, err := conn.Subscribe(context.Background(), "stress.burst", func(_ context.Context, _ *qpnats.Message) error {
+	sub, err := conn.Subscribe(context.Background(), "stress.burst", func(_ context.Context, _ *natsio.Msg) error {
 		if received.Add(1) == 1 {
 			firstAt.Store(time.Now().UnixNano())
 		}

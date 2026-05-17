@@ -7,6 +7,7 @@ import (
 	"time"
 
 	natsio "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
@@ -33,8 +34,10 @@ const (
 // DLQ adds three headers to the republished message (HeaderDLQReason,
 // HeaderDLQSubject, HeaderDLQAt). Original headers are preserved.
 //
-// If the DLQ publish itself fails, DLQ returns the joined original +
-// publish error so an outer retry/redelivery path can recover.
+// If the DLQ publish itself fails, DLQ returns the joined original + publish
+// error so an outer retry/redelivery path can recover. ErrTerminate is not
+// preserved on DLQ publish failure because JetStream dispatch would otherwise
+// treat the failure as a Term signal and drop the original message.
 //
 // Composition:
 //   - DLQ INSIDE Retry: each failed attempt is DLQ'd; Retry sees DLQ's
@@ -60,7 +63,7 @@ func DLQ(
 		shouldDLQ = defaultShouldDLQ
 	}
 
-	return func(ctx context.Context, m *qpnats.Message) error {
+	return func(ctx context.Context, m *natsio.Msg) error {
 		err := h(ctx, m)
 		if err == nil {
 			return nil
@@ -79,8 +82,8 @@ func DLQ(
 		}
 		addDLQHeaders(out.Header, err, subjectOf(m))
 
-		if perr := conn.PublishMsg(&qpnats.Message{Msg: out}); perr != nil {
-			return errors.Join(err, fmt.Errorf("dlq publish %q: %w", subject, perr))
+		if perr := conn.PublishMsg(out); perr != nil {
+			return dlqPublishError(err, subject, perr)
 		}
 		return nil
 	}
@@ -105,7 +108,7 @@ func DLQJet(
 		shouldDLQ = defaultShouldDLQ
 	}
 
-	return func(ctx context.Context, m *qpnats.JetMessage) error {
+	return func(ctx context.Context, m jetstream.Msg) error {
 		err := h(ctx, m)
 		if err == nil {
 			return nil
@@ -119,13 +122,13 @@ func DLQJet(
 
 		out := &natsio.Msg{
 			Subject: subject,
-			Data:    m.Data(),
-			Header:  cloneHeader(m.Headers()),
+			Data:    jetDataOf(m),
+			Header:  cloneHeader(jetHeaderOf(m)),
 		}
-		addDLQHeaders(out.Header, err, m.Subject())
+		addDLQHeaders(out.Header, err, jetSubjectOf(m))
 
 		if _, perr := js.PublishMsg(ctx, out); perr != nil {
-			return errors.Join(err, fmt.Errorf("dlq publish %q: %w", subject, perr))
+			return dlqPublishError(err, subject, perr)
 		}
 		return nil
 	}
@@ -144,6 +147,17 @@ func defaultShouldDLQ(err error) bool {
 	return true
 }
 
+func dlqPublishError(handlerErr error, subject string, publishErr error) error {
+	publishErr = fmt.Errorf("dlq publish %q: %w", subject, publishErr)
+	if errors.Is(handlerErr, qpnats.ErrTerminate) {
+		// If a DLQ write fails, do not preserve ErrTerminate in the returned
+		// error. JetStream dispatch treats ErrTerminate as a Term signal; the
+		// right recovery path for failed DLQ writes is redelivery.
+		return fmt.Errorf("%v: %w", handlerErr, publishErr)
+	}
+	return errors.Join(handlerErr, publishErr)
+}
+
 func addDLQHeaders(h natsio.Header, err error, origSubject string) {
 	h.Set(HeaderDLQReason, err.Error())
 	h.Set(HeaderDLQSubject, origSubject)
@@ -158,27 +172,48 @@ func cloneHeader(h natsio.Header) natsio.Header {
 	return out
 }
 
-// Helpers to extract fields from *qpnats.Message without requiring the
-// caller to pass them separately. They tolerate a nil embedded *nats.Msg
-// because *Message is sometimes constructed for tests that way.
+// Helpers to extract fields from messages without requiring the caller to pass
+// them separately. They tolerate nil messages because tests sometimes build
+// intentionally sparse values.
 
-func dataOf(m *qpnats.Message) []byte {
-	if m == nil || m.Msg == nil {
+func dataOf(m *natsio.Msg) []byte {
+	if m == nil {
 		return nil
 	}
 	return m.Data
 }
 
-func headerOf(m *qpnats.Message) natsio.Header {
-	if m == nil || m.Msg == nil {
+func headerOf(m *natsio.Msg) natsio.Header {
+	if m == nil {
 		return nil
 	}
 	return m.Header
 }
 
-func subjectOf(m *qpnats.Message) string {
-	if m == nil || m.Msg == nil {
+func subjectOf(m *natsio.Msg) string {
+	if m == nil {
 		return ""
 	}
 	return m.Subject
+}
+
+func jetDataOf(m jetstream.Msg) []byte {
+	if m == nil {
+		return nil
+	}
+	return m.Data()
+}
+
+func jetHeaderOf(m jetstream.Msg) natsio.Header {
+	if m == nil {
+		return nil
+	}
+	return m.Headers()
+}
+
+func jetSubjectOf(m jetstream.Msg) string {
+	if m == nil {
+		return ""
+	}
+	return m.Subject()
 }

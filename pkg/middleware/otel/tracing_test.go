@@ -1,4 +1,4 @@
-package middleware
+package otel
 
 import (
 	"context"
@@ -8,15 +8,13 @@ import (
 
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"go.opentelemetry.io/otel"
+	otelapi "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
-
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // ---------------- test setup ----------------
@@ -30,7 +28,7 @@ func newRecorder() (*tracetest.SpanRecorder, trace.Tracer) {
 // TestMain registers a W3C TraceContext propagator so Inject/Extract
 // can round-trip via NATS headers.
 func TestMain(m *testing.M) {
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otelapi.SetTextMapPropagator(propagation.TraceContext{})
 	m.Run()
 }
 
@@ -51,9 +49,9 @@ func (s *stubJSMsg) Subject() string        { return s.subject }
 
 func TestTraceStartsHandleSpan(t *testing.T) {
 	r, tracer := newRecorder()
-	h := Trace(func(_ context.Context, _ *qpnats.Message) error { return nil }, tracer)
+	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, tracer)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "foo", Data: []byte("body"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "foo", Data: []byte("body"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -73,9 +71,9 @@ func TestTraceStartsHandleSpan(t *testing.T) {
 func TestTraceRecordsErrorOnHandlerError(t *testing.T) {
 	r, tracer := newRecorder()
 	sentinel := errors.New("nope")
-	h := Trace(func(_ context.Context, _ *qpnats.Message) error { return sentinel }, tracer)
+	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return sentinel }, tracer)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want sentinel", err)
 	}
@@ -110,11 +108,11 @@ func TestTraceExtractsParent(t *testing.T) {
 
 	// Inject the parent into headers as a caller in another service would.
 	header := natsio.Header{}
-	otel.GetTextMapPropagator().Inject(parentCtx, HeaderCarrier{Header: header})
+	otelapi.GetTextMapPropagator().Inject(parentCtx, HeaderCarrier{Header: header})
 	parentSpan.End()
 
-	h := Trace(func(_ context.Context, _ *qpnats.Message) error { return nil }, tracer)
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: header}}
+	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, tracer)
+	m := &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: header}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -141,11 +139,11 @@ func TestTraceExtractsParent(t *testing.T) {
 
 func TestTraceAttributes(t *testing.T) {
 	r, tracer := newRecorder()
-	h := Trace(func(_ context.Context, _ *qpnats.Message) error { return nil }, tracer)
+	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, tracer)
 
 	header := natsio.Header{}
 	header.Set("Nats-Msg-Id", "msg-42")
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "events.user.signup", Data: []byte("hello"), Header: header}}
+	m := &natsio.Msg{Subject: "events.user.signup", Data: []byte("hello"), Header: header}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -174,14 +172,14 @@ func TestTraceAttributes(t *testing.T) {
 
 func TestTracePropagatesCtx(t *testing.T) {
 	r, tracer := newRecorder()
-	h := Trace(func(ctx context.Context, _ *qpnats.Message) error {
+	h := Trace(func(ctx context.Context, _ *natsio.Msg) error {
 		// Handler should see the active span via ctx.
 		span := trace.SpanFromContext(ctx)
 		span.SetAttributes(attribute.String("handler.stamp", "yes"))
 		return nil
 	}, tracer)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "x", Data: []byte("b"), Header: natsio.Header{}}}
+	m := &natsio.Msg{Subject: "x", Data: []byte("b"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -202,18 +200,18 @@ func TestTraceJetEquivalent(t *testing.T) {
 	parentCtx, parentSpan := tracer.Start(context.Background(), "parent")
 	parentTraceID := parentSpan.SpanContext().TraceID()
 	header := natsio.Header{}
-	otel.GetTextMapPropagator().Inject(parentCtx, HeaderCarrier{Header: header})
+	otelapi.GetTextMapPropagator().Inject(parentCtx, HeaderCarrier{Header: header})
 	header.Set("Nats-Msg-Id", "js-7")
 	parentSpan.End()
 
 	sentinel := errors.New("nope from js")
-	h := TraceJet(func(_ context.Context, _ *qpnats.JetMessage) error { return sentinel }, tracer)
+	h := TraceJet(func(_ context.Context, _ jetstream.Msg) error { return sentinel }, tracer)
 
-	jm := &qpnats.JetMessage{Msg: &stubJSMsg{
+	jm := &stubJSMsg{
 		subject: "orders.new",
 		data:    []byte("payload"),
 		headers: header,
-	}}
+	}
 
 	if err := h(context.Background(), jm); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want sentinel", err)

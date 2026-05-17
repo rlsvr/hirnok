@@ -10,6 +10,7 @@ import (
 	"time"
 
 	natsio "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
@@ -261,11 +262,11 @@ func TestRetryAroundRecover(t *testing.T) {
 // ---------------- Integration with pkg/nats types ----------------
 
 func TestRecoverAssignableToNatsHandler(t *testing.T) {
-	var coreH qpnats.Handler = func(_ context.Context, _ *qpnats.Message) error { return nil }
+	var coreH qpnats.Handler = func(_ context.Context, _ *natsio.Msg) error { return nil }
 
 	var wrapped qpnats.Handler = Recover(coreH)
 
-	m := &qpnats.Message{Msg: &natsio.Msg{Subject: "t", Data: []byte("x")}}
+	m := &natsio.Msg{Subject: "t", Data: []byte("x")}
 	if err := wrapped(context.Background(), m); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -273,7 +274,7 @@ func TestRecoverAssignableToNatsHandler(t *testing.T) {
 
 func TestRetryAssignableToJetHandler(t *testing.T) {
 	var calls atomic.Int32
-	var jetH qpnats.JetHandler = func(_ context.Context, _ *qpnats.JetMessage) error {
+	var jetH qpnats.JetHandler = func(_ context.Context, _ jetstream.Msg) error {
 		if calls.Add(1) < 2 {
 			return errors.New("transient")
 		}
@@ -283,7 +284,7 @@ func TestRetryAssignableToJetHandler(t *testing.T) {
 	var wrapped qpnats.JetHandler = Retry(jetH, 3, time.Millisecond, 0, nil)
 
 	// Verify the assignment compiles AND the wrapper still drives the
-	// handler. nil JetMessage is fine — our test handler ignores it.
+	// handler. nil jetstream.Msg is fine — our test handler ignores it.
 	if err := wrapped(context.Background(), nil); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}

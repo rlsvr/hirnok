@@ -33,7 +33,7 @@ func TestJetStreamContext(t *testing.T) {
 	}
 }
 
-func TestConsumeAckOnNil(t *testing.T) {
+func TestNewConsumerAckOnNil(t *testing.T) {
 	s := runJSServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 2})
 	j := mustJetStream(t, c)
@@ -47,16 +47,16 @@ func TestConsumeAckOnNil(t *testing.T) {
 	}
 
 	var seen atomic.Int32
-	cons, err := j.Consume(context.Background(), "S1", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S1", jetstream.ConsumerConfig{
 		Durable:       "c1",
 		FilterSubject: "s1.>",
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, _ *JetMessage) error {
+	}, func(_ context.Context, _ jetstream.Msg) error {
 		seen.Add(1)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	defer cons.Stop()
 
@@ -79,7 +79,7 @@ func TestConsumeAckOnNil(t *testing.T) {
 	}
 }
 
-func TestConsumeNakOnError(t *testing.T) {
+func TestNewConsumerNakOnError(t *testing.T) {
 	s := runJSServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
 	j := mustJetStream(t, c)
@@ -91,11 +91,11 @@ func TestConsumeNakOnError(t *testing.T) {
 
 	var seen atomic.Int32
 	delivered := make(chan uint64, 4)
-	cons, err := j.Consume(context.Background(), "S2", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S2", jetstream.ConsumerConfig{
 		Durable:       "c2",
 		FilterSubject: "s2.>",
 		AckWait:       500 * time.Millisecond,
-	}, func(_ context.Context, m *JetMessage) error {
+	}, func(_ context.Context, m jetstream.Msg) error {
 		md, _ := m.Metadata()
 		delivered <- md.NumDelivered
 		if seen.Add(1) == 1 {
@@ -104,7 +104,7 @@ func TestConsumeNakOnError(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	defer cons.Stop()
 
@@ -118,7 +118,7 @@ func TestConsumeNakOnError(t *testing.T) {
 		}
 	}
 	if maxN < 2 {
-		t.Fatalf("NumDelivered never reached 2 (got max %d) — Nak did not trigger redelivery", maxN)
+		t.Fatalf("NumDelivered never reached 2 (got max %d) - Nak did not trigger redelivery", maxN)
 	}
 }
 
@@ -133,16 +133,16 @@ func TestConsumerUpsertIdempotent(t *testing.T) {
 		FilterSubject: "s3.>",
 		AckWait:       2 * time.Second,
 	}
-	cons1, err := j.Consume(context.Background(), "S3", cfg, func(_ context.Context, _ *JetMessage) error { return nil })
+	cons1, err := j.NewConsumer(context.Background(), "S3", cfg, func(_ context.Context, _ jetstream.Msg) error { return nil })
 	if err != nil {
-		t.Fatalf("first consume: %v", err)
+		t.Fatalf("first new consumer: %v", err)
 	}
 	cons1.Stop()
 
 	cfg.AckWait = 5 * time.Second
-	cons2, err := j.Consume(context.Background(), "S3", cfg, func(_ context.Context, _ *JetMessage) error { return nil })
+	cons2, err := j.NewConsumer(context.Background(), "S3", cfg, func(_ context.Context, _ jetstream.Msg) error { return nil })
 	if err != nil {
-		t.Fatalf("second consume (upsert): %v", err)
+		t.Fatalf("second new consumer (upsert): %v", err)
 	}
 	cons2.Stop()
 }
@@ -158,16 +158,16 @@ func TestConsumerStopHaltsDelivery(t *testing.T) {
 	}
 
 	var seen atomic.Int32
-	cons, err := j.Consume(context.Background(), "S4", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S4", jetstream.ConsumerConfig{
 		Durable:       "c4",
 		FilterSubject: "s4.>",
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, _ *JetMessage) error {
+	}, func(_ context.Context, _ jetstream.Msg) error {
 		seen.Add(1)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	waitFor(t, 2*time.Second, func() bool { return seen.Load() == 1 })
 	cons.Stop()
@@ -256,20 +256,20 @@ func TestPublishAsync(t *testing.T) {
 	}
 }
 
-func TestConsumeRespectsContext(t *testing.T) {
+func TestNewConsumerRespectsContext(t *testing.T) {
 	s := runJSServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
 	j := mustJetStream(t, c)
 	ensureStream(t, j, "S8", "s8.>")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cons, err := j.Consume(ctx, "S8", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(ctx, "S8", jetstream.ConsumerConfig{
 		Durable:       "c8",
 		FilterSubject: "s8.>",
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, _ *JetMessage) error { return nil })
+	}, func(_ context.Context, _ jetstream.Msg) error { return nil })
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	cancel()
 	select {
@@ -279,7 +279,7 @@ func TestConsumeRespectsContext(t *testing.T) {
 	}
 }
 
-func TestConsumeFilterSubject(t *testing.T) {
+func TestNewConsumerFilterSubject(t *testing.T) {
 	s := runJSServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
 	j := mustJetStream(t, c)
@@ -293,16 +293,16 @@ func TestConsumeFilterSubject(t *testing.T) {
 	}
 
 	got := make(chan string, 4)
-	cons, err := j.Consume(context.Background(), "S9", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S9", jetstream.ConsumerConfig{
 		Durable:       "c9",
 		FilterSubject: "s9.bar",
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, m *JetMessage) error {
+	}, func(_ context.Context, m jetstream.Msg) error {
 		got <- m.Subject()
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	defer cons.Stop()
 
@@ -337,11 +337,11 @@ func TestHandlerCtxCancelsAtAckWait(t *testing.T) {
 
 	ctxErrs := make(chan error, 4)
 	deliveries := make(chan uint64, 4)
-	cons, err := j.Consume(context.Background(), "S10", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S10", jetstream.ConsumerConfig{
 		Durable:       "c10",
 		FilterSubject: "s10.>",
 		AckWait:       300 * time.Millisecond,
-	}, func(ctx context.Context, m *JetMessage) error {
+	}, func(ctx context.Context, m jetstream.Msg) error {
 		md, _ := m.Metadata()
 		deliveries <- md.NumDelivered
 		<-ctx.Done()
@@ -349,7 +349,7 @@ func TestHandlerCtxCancelsAtAckWait(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	defer cons.Stop()
 
@@ -384,11 +384,11 @@ func TestHandlerCtxCancelsOnStop(t *testing.T) {
 
 	started := make(chan struct{})
 	ctxErr := make(chan error, 1)
-	cons, err := j.Consume(context.Background(), "S11", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S11", jetstream.ConsumerConfig{
 		Durable:       "c11",
 		FilterSubject: "s11.>",
 		AckWait:       30 * time.Second,
-	}, func(ctx context.Context, _ *JetMessage) error {
+	}, func(ctx context.Context, _ jetstream.Msg) error {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -398,7 +398,7 @@ func TestHandlerCtxCancelsOnStop(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	select {
 	case <-started:
@@ -429,13 +429,13 @@ func TestConsumerWaitAfterStop(t *testing.T) {
 	j := mustJetStream(t, c)
 	ensureStream(t, j, "S12", "s12.>")
 
-	cons, err := j.Consume(context.Background(), "S12", jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), "S12", jetstream.ConsumerConfig{
 		Durable:       "c12",
 		FilterSubject: "s12.>",
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, _ *JetMessage) error { return nil })
+	}, func(_ context.Context, _ jetstream.Msg) error { return nil })
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	cons.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -445,20 +445,210 @@ func TestConsumerWaitAfterStop(t *testing.T) {
 	}
 }
 
-func TestErrTerminateAckedOnJS(t *testing.T) {
-	assertSentinelAcked(t, func() error {
+func TestConsumerDrainWaitsForInFlightWithoutCancel(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_DRAIN", "s_drain.>")
+
+	if _, err := j.Publish(context.Background(), "s_drain.x", []byte("z")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ctxErr := make(chan error, 1)
+	cons, err := j.NewConsumer(context.Background(), "S_DRAIN", jetstream.ConsumerConfig{
+		Durable:       "c_drain",
+		FilterSubject: "s_drain.>",
+		AckWait:       30 * time.Second,
+	}, func(ctx context.Context, _ jetstream.Msg) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		ctxErr <- ctx.Err()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- cons.Drain(waitCtx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Drain returned before in-flight handler completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not return")
+	}
+	if err := <-ctxErr; err != nil {
+		t.Fatalf("handler ctx err = %v, want nil", err)
+	}
+}
+
+func TestNewConsumerOptionsOverrideConfig(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{QueueSize: 64, Workers: 1})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_OPTS", "s_opts.>")
+
+	cons, err := j.NewConsumer(context.Background(), "S_OPTS", jetstream.ConsumerConfig{
+		Durable:       "c_opts",
+		FilterSubject: "s_opts.>",
+		AckWait:       2 * time.Second,
+	}, func(_ context.Context, _ jetstream.Msg) error { return nil }, WithQueueSize(5), WithWorkers(2))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	if got := cons.q.Cap(); got != 5 {
+		t.Fatalf("queue cap = %d, want 5", got)
+	}
+}
+
+func TestNewPushConsumerReceivesAndAcks(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 2})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_PUSH", "s_push.>")
+
+	var seen atomic.Int32
+	gotData := make(chan string, 4)
+	cons, err := j.NewPushConsumer(context.Background(), "S_PUSH", jetstream.ConsumerConfig{
+		Durable:        "c_push",
+		DeliverSubject: natsio.NewInbox(),
+		DeliverGroup:   "c_push_group",
+		FilterSubject:  "s_push.>",
+		AckWait:        2 * time.Second,
+	}, func(_ context.Context, m jetstream.Msg) error {
+		gotData <- string(m.Data())
+		seen.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("new push consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	if _, err := j.Publish(context.Background(), "s_push.x", []byte("push")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return seen.Load() == 1 })
+	if got := <-gotData; got != "push" {
+		t.Fatalf("data=%q, want push", got)
+	}
+
+	stream, err := j.Raw().Stream(context.Background(), "S_PUSH")
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	consInfo, err := stream.PushConsumer(context.Background(), "c_push")
+	if err != nil {
+		t.Fatalf("push consumer: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		info, err := consInfo.Info(context.Background())
+		if err != nil {
+			t.Fatalf("info: %v", err)
+		}
+		return info.NumPending == 0 && info.NumAckPending == 0
+	})
+}
+
+func TestNewPushConsumerDefaultsDeliverSubject(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_PUSH_AUTO", "s_push_auto.>")
+
+	var seen atomic.Int32
+	cons, err := j.NewPushConsumer(context.Background(), "S_PUSH_AUTO", jetstream.ConsumerConfig{
+		Name:          "c_push_auto",
+		FilterSubject: "s_push_auto.>",
+		AckWait:       2 * time.Second,
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		seen.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("new push consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	stream, err := j.Raw().Stream(context.Background(), "S_PUSH_AUTO")
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	consInfo, err := stream.PushConsumer(context.Background(), "c_push_auto")
+	if err != nil {
+		t.Fatalf("push consumer: %v", err)
+	}
+	info, err := consInfo.Info(context.Background())
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	if info.Config.DeliverSubject == "" {
+		t.Fatal("DeliverSubject was not defaulted")
+	}
+
+	if _, err := j.Publish(context.Background(), "s_push_auto.x", []byte("push")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return seen.Load() == 1 })
+}
+
+func TestConsumeAlias(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_ALIAS", "s_alias.>")
+
+	cons, err := j.Consume(context.Background(), "S_ALIAS", jetstream.ConsumerConfig{
+		Durable:       "c_alias",
+		FilterSubject: "s_alias.>",
+		AckWait:       2 * time.Second,
+	}, func(_ context.Context, _ jetstream.Msg) error { return nil })
+	if err != nil {
+		t.Fatalf("consume alias: %v", err)
+	}
+	cons.Stop()
+}
+
+func TestErrTerminateTerminatedOnJS(t *testing.T) {
+	assertSentinelHandled(t, func() error {
 		return fmt.Errorf("bad payload: %w", ErrTerminate)
 	}, "S_TERM", "s_term.>", "c_term")
 }
 
 func TestErrSkipAckedOnJS(t *testing.T) {
-	assertSentinelAcked(t, func() error { return ErrSkip }, "S_SKIP", "s_skip.>", "c_skip")
+	assertSentinelHandled(t, func() error { return ErrSkip }, "S_SKIP", "s_skip.>", "c_skip")
 }
 
-// assertSentinelAcked publishes a single message, runs a handler that
-// returns the given sentinel error, and verifies the message is acked
-// (i.e. not redelivered) — handler called exactly once, no pending.
-func assertSentinelAcked(t *testing.T, returnErr func() error, stream, subjectPattern, consumer string) {
+// assertSentinelHandled publishes a single message, runs a handler that
+// returns the given sentinel error, and verifies the message is not
+// redelivered - handler called exactly once, no pending.
+func assertSentinelHandled(t *testing.T, returnErr func() error, stream, subjectPattern, consumer string) {
 	t.Helper()
 	s := runJSServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
@@ -471,16 +661,16 @@ func assertSentinelAcked(t *testing.T, returnErr func() error, stream, subjectPa
 	}
 
 	var calls atomic.Int32
-	cons, err := j.Consume(context.Background(), stream, jetstream.ConsumerConfig{
+	cons, err := j.NewConsumer(context.Background(), stream, jetstream.ConsumerConfig{
 		Durable:       consumer,
 		FilterSubject: subjectPattern,
 		AckWait:       2 * time.Second,
-	}, func(_ context.Context, _ *JetMessage) error {
+	}, func(_ context.Context, _ jetstream.Msg) error {
 		calls.Add(1)
 		return returnErr()
 	})
 	if err != nil {
-		t.Fatalf("consume: %v", err)
+		t.Fatalf("new consumer: %v", err)
 	}
 	defer cons.Stop()
 
@@ -516,6 +706,7 @@ type dispatchStub struct {
 	mu       sync.Mutex
 	acked    int
 	naked    int
+	termed   int
 	ackDelay time.Duration // optional sleep inside Ack (for ctx-expiry test)
 }
 
@@ -536,52 +727,59 @@ func (s *dispatchStub) Nak() error {
 	return nil
 }
 
-func (s *dispatchStub) snapshot() (int, int) {
+func (s *dispatchStub) Term() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.acked, s.naked
+	s.termed++
+	return nil
+}
+
+func (s *dispatchStub) snapshot() (int, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acked, s.naked, s.termed
 }
 
 func TestDispatchJetDirect(t *testing.T) {
 	t.Run("nil_error_acks", func(t *testing.T) {
 		stub := &dispatchStub{}
-		h := func(_ context.Context, _ *JetMessage) error { return nil }
-		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
-		a, n := stub.snapshot()
-		if a != 1 || n != 0 {
-			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		h := func(_ context.Context, _ jetstream.Msg) error { return nil }
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		if a != 1 || n != 0 || term != 0 {
+			t.Fatalf("acks=%d naks=%d terms=%d, want 1 0 0", a, n, term)
 		}
 	})
 
 	t.Run("plain_error_naks", func(t *testing.T) {
 		stub := &dispatchStub{}
-		h := func(_ context.Context, _ *JetMessage) error { return errors.New("boom") }
-		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
-		a, n := stub.snapshot()
-		if a != 0 || n != 1 {
-			t.Fatalf("acks=%d naks=%d, want 0 1", a, n)
+		h := func(_ context.Context, _ jetstream.Msg) error { return errors.New("boom") }
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		if a != 0 || n != 1 || term != 0 {
+			t.Fatalf("acks=%d naks=%d terms=%d, want 0 1 0", a, n, term)
 		}
 	})
 
-	t.Run("err_terminate_acks", func(t *testing.T) {
+	t.Run("err_terminate_terms", func(t *testing.T) {
 		stub := &dispatchStub{}
-		h := func(_ context.Context, _ *JetMessage) error {
+		h := func(_ context.Context, _ jetstream.Msg) error {
 			return fmt.Errorf("bad: %w", ErrTerminate)
 		}
-		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
-		a, n := stub.snapshot()
-		if a != 1 || n != 0 {
-			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		if a != 0 || n != 0 || term != 1 {
+			t.Fatalf("acks=%d naks=%d terms=%d, want 0 0 1", a, n, term)
 		}
 	})
 
 	t.Run("err_skip_acks", func(t *testing.T) {
 		stub := &dispatchStub{}
-		h := func(_ context.Context, _ *JetMessage) error { return ErrSkip }
-		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
-		a, n := stub.snapshot()
-		if a != 1 || n != 0 {
-			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		h := func(_ context.Context, _ jetstream.Msg) error { return ErrSkip }
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		if a != 1 || n != 0 || term != 0 {
+			t.Fatalf("acks=%d naks=%d terms=%d, want 1 0 0", a, n, term)
 		}
 	})
 
@@ -589,14 +787,14 @@ func TestDispatchJetDirect(t *testing.T) {
 		stub := &dispatchStub{}
 		// Handler observes its ctx expiring and returns its err; dispatch
 		// sees ctx.Err() != nil and does nothing (neither Ack nor Nak).
-		h := func(ctx context.Context, _ *JetMessage) error {
+		h := func(ctx context.Context, _ jetstream.Msg) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}
-		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, 10*time.Millisecond)
-		a, n := stub.snapshot()
-		if a != 0 || n != 0 {
-			t.Fatalf("acks=%d naks=%d, want 0 0 (ctx expiry → no ack action)", a, n)
+		DispatchJet(context.Background(), h, stub, 10*time.Millisecond)
+		a, n, term := stub.snapshot()
+		if a != 0 || n != 0 || term != 0 {
+			t.Fatalf("acks=%d naks=%d terms=%d, want 0 0 0 (ctx expiry -> no ack action)", a, n, term)
 		}
 	})
 }

@@ -86,12 +86,53 @@ func TestConnectRequiresURL(t *testing.T) {
 	}
 }
 
+func TestNATSOptionsOverrideDefaults(t *testing.T) {
+	s := runServer(t)
+	c, err := Connect(Config{
+		URL:  s.ClientURL(),
+		Name: "config-name",
+		NATSOptions: []natsio.Option{
+			natsio.Name("option-name"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Close()
+
+	if got := c.Raw().Opts.Name; got != "option-name" {
+		t.Fatalf("name = %q, want option-name", got)
+	}
+}
+
+func TestRunOptionsOverrideConfig(t *testing.T) {
+	run := Config{
+		QueueSize: 64,
+		Workers:   1,
+		AckBuffer: time.Second,
+	}.runOptions([]Option{
+		WithQueueSize(3),
+		WithWorkers(4),
+		WithAckBuffer(2 * time.Second),
+	})
+
+	if run.queueSize != 3 {
+		t.Fatalf("queueSize = %d, want 3", run.queueSize)
+	}
+	if run.workers != 4 {
+		t.Fatalf("workers = %d, want 4", run.workers)
+	}
+	if run.ackBuffer != 2*time.Second {
+		t.Fatalf("ackBuffer = %v, want 2s", run.ackBuffer)
+	}
+}
+
 func TestSubscribePublishRoundTrip(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{})
 
-	got := make(chan *Message, 1)
-	sub, err := c.Subscribe(context.Background(), "foo", func(_ context.Context, m *Message) error {
+	got := make(chan *natsio.Msg, 1)
+	sub, err := c.Subscribe(context.Background(), "foo", func(_ context.Context, m *natsio.Msg) error {
 		got <- m
 		return nil
 	})
@@ -121,8 +162,8 @@ func TestPublishMsgPreservesHeaders(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{})
 
-	got := make(chan *Message, 1)
-	sub, err := c.Subscribe(context.Background(), "hdr", func(_ context.Context, m *Message) error {
+	got := make(chan *natsio.Msg, 1)
+	sub, err := c.Subscribe(context.Background(), "hdr", func(_ context.Context, m *natsio.Msg) error {
 		got <- m
 		return nil
 	})
@@ -131,7 +172,7 @@ func TestPublishMsgPreservesHeaders(t *testing.T) {
 	}
 	defer sub.Unsubscribe() //nolint:errcheck
 
-	msg := &Message{Msg: &natsio.Msg{Subject: "hdr", Data: []byte("body"), Header: natsio.Header{}}}
+	msg := &natsio.Msg{Subject: "hdr", Data: []byte("body"), Header: natsio.Header{}}
 	msg.Header.Set("X-Foo", "bar")
 	if err := c.PublishMsg(msg); err != nil {
 		t.Fatalf("PublishMsg: %v", err)
@@ -151,10 +192,7 @@ func TestPublishMsgNilRejected(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{})
 	if err := c.PublishMsg(nil); err == nil {
-		t.Fatal("expected error for nil Message")
-	}
-	if err := c.PublishMsg(&Message{}); err == nil {
-		t.Fatal("expected error for Message with nil Msg")
+		t.Fatal("expected error for nil msg")
 	}
 }
 
@@ -162,7 +200,7 @@ func TestRequestReply(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{})
 
-	sub, err := c.Subscribe(context.Background(), "echo", func(_ context.Context, m *Message) error {
+	sub, err := c.Subscribe(context.Background(), "echo", func(_ context.Context, m *natsio.Msg) error {
 		return m.Respond(append([]byte("re:"), m.Data...))
 	})
 	if err != nil {
@@ -190,7 +228,7 @@ func TestMultiWorkerFanOut(t *testing.T) {
 	var peak atomic.Int32
 	var inflight atomic.Int32
 
-	sub, err := c.Subscribe(context.Background(), "fan", func(_ context.Context, _ *Message) error {
+	sub, err := c.Subscribe(context.Background(), "fan", func(_ context.Context, _ *natsio.Msg) error {
 		cur := inflight.Add(1)
 		for {
 			old := peak.Load()
@@ -220,12 +258,48 @@ func TestMultiWorkerFanOut(t *testing.T) {
 	}
 }
 
+func TestSubscribeOptionsOverrideConfig(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{QueueSize: 64, Workers: 1})
+
+	release := make(chan struct{})
+	var inflight atomic.Int32
+	var peak atomic.Int32
+	sub, err := c.Subscribe(context.Background(), "opts", func(_ context.Context, _ *natsio.Msg) error {
+		cur := inflight.Add(1)
+		for {
+			old := peak.Load()
+			if cur <= old || peak.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		<-release
+		inflight.Add(-1)
+		return nil
+	}, WithQueueSize(3), WithWorkers(3))
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Unsubscribe() //nolint:errcheck
+	defer close(release)
+
+	if got := sub.q.Cap(); got != 3 {
+		t.Fatalf("queue cap = %d, want 3", got)
+	}
+	for range 3 {
+		if err := c.Publish("opts", []byte("x")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	waitFor(t, time.Second, func() bool { return peak.Load() == 3 })
+}
+
 func TestHandlerErrorDoesNotStopWorkers(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
 
 	var seen atomic.Int32
-	sub, err := c.Subscribe(context.Background(), "err", func(_ context.Context, _ *Message) error {
+	sub, err := c.Subscribe(context.Background(), "err", func(_ context.Context, _ *natsio.Msg) error {
 		n := seen.Add(1)
 		if n%2 == 1 {
 			return errors.New("boom")
@@ -250,7 +324,7 @@ func TestUnsubscribeStopsWorkers(t *testing.T) {
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 2})
 
 	var seen atomic.Int32
-	sub, err := c.Subscribe(context.Background(), "unsub", func(_ context.Context, _ *Message) error {
+	sub, err := c.Subscribe(context.Background(), "unsub", func(_ context.Context, _ *natsio.Msg) error {
 		seen.Add(1)
 		return nil
 	})
@@ -287,7 +361,7 @@ func TestCloseStopsAllSubs(t *testing.T) {
 
 	var seen atomic.Int32
 	for _, subj := range []string{"a", "b"} {
-		_, err := c.Subscribe(context.Background(), subj, func(_ context.Context, _ *Message) error {
+		_, err := c.Subscribe(context.Background(), subj, func(_ context.Context, _ *natsio.Msg) error {
 			seen.Add(1)
 			return nil
 		})
@@ -310,7 +384,7 @@ func TestCloseStopsAllSubs(t *testing.T) {
 func TestQueueSubscribeRequiresGroup(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{})
-	_, err := c.QueueSubscribe(context.Background(), "g", "", func(_ context.Context, _ *Message) error { return nil })
+	_, err := c.QueueSubscribe(context.Background(), "g", "", func(_ context.Context, _ *natsio.Msg) error { return nil })
 	if err == nil {
 		t.Fatal("expected error for empty group")
 	}
@@ -321,7 +395,7 @@ func TestQueueSubscribeLoadBalances(t *testing.T) {
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
 
 	var a, b atomic.Int32
-	subA, err := c.QueueSubscribe(context.Background(), "lb", "grp", func(_ context.Context, _ *Message) error {
+	subA, err := c.QueueSubscribe(context.Background(), "lb", "grp", func(_ context.Context, _ *natsio.Msg) error {
 		a.Add(1)
 		return nil
 	})
@@ -330,7 +404,7 @@ func TestQueueSubscribeLoadBalances(t *testing.T) {
 	}
 	defer subA.Unsubscribe() //nolint:errcheck
 
-	subB, err := c.QueueSubscribe(context.Background(), "lb", "grp", func(_ context.Context, _ *Message) error {
+	subB, err := c.QueueSubscribe(context.Background(), "lb", "grp", func(_ context.Context, _ *natsio.Msg) error {
 		b.Add(1)
 		return nil
 	})
@@ -358,7 +432,7 @@ func TestSubscribeRespectsContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var seen atomic.Int32
-	sub, err := c.Subscribe(ctx, "ctx", func(_ context.Context, _ *Message) error {
+	sub, err := c.Subscribe(ctx, "ctx", func(_ context.Context, _ *natsio.Msg) error {
 		seen.Add(1)
 		return nil
 	})
@@ -383,7 +457,7 @@ func TestSubWaitUnblocksAfterUnsubscribe(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 2})
 
-	sub, err := c.Subscribe(context.Background(), "wait", func(_ context.Context, _ *Message) error { return nil })
+	sub, err := c.Subscribe(context.Background(), "wait", func(_ context.Context, _ *natsio.Msg) error { return nil })
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -401,7 +475,7 @@ func TestSubWaitUnblocksAfterUnsubscribe(t *testing.T) {
 func TestSubWaitRespectsCtx(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
-	sub, err := c.Subscribe(context.Background(), "wait2", func(_ context.Context, _ *Message) error { return nil })
+	sub, err := c.Subscribe(context.Background(), "wait2", func(_ context.Context, _ *natsio.Msg) error { return nil })
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -414,6 +488,135 @@ func TestSubWaitRespectsCtx(t *testing.T) {
 	}
 }
 
+func TestSubDrainWaitsForInFlightWithoutCancel(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ctxErr := make(chan error, 1)
+	sub, err := c.Subscribe(context.Background(), "drain", func(ctx context.Context, _ *natsio.Msg) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		ctxErr <- ctx.Err()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err := c.Publish("drain", []byte("x")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sub.Drain(waitCtx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Drain returned before in-flight handler completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Drain did not return")
+	}
+	if err := <-ctxErr; err != nil {
+		t.Fatalf("handler ctx err = %v, want nil", err)
+	}
+}
+
+func TestSubStopIdempotent(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+
+	sub, err := c.Subscribe(context.Background(), "stop-idem", func(_ context.Context, _ *natsio.Msg) error { return nil })
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if err := sub.Stop(); err != nil {
+		t.Fatalf("first Stop: %v", err)
+	}
+	if err := sub.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe after Stop: %v", err)
+	}
+	if err := sub.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
+func TestConnShutdownDrainsSubs(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	sub, err := c.Subscribe(context.Background(), "shutdown", func(_ context.Context, _ *natsio.Msg) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	_ = sub
+
+	if err := c.Publish("shutdown", []byte("x")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Shutdown(waitCtx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Shutdown returned before in-flight handler completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return")
+	}
+	if !c.Raw().IsClosed() {
+		t.Fatal("raw NATS connection should be closed after Shutdown")
+	}
+}
+
 func TestQueueSizeBackpressure(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL(), Config{QueueSize: 1, Workers: 1})
@@ -423,7 +626,7 @@ func TestQueueSizeBackpressure(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	first := make(chan struct{}, 1)
-	sub, err := c.Subscribe(context.Background(), "bp", func(_ context.Context, _ *Message) error {
+	sub, err := c.Subscribe(context.Background(), "bp", func(_ context.Context, _ *natsio.Msg) error {
 		select {
 		case first <- struct{}{}:
 		default:

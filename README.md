@@ -1,19 +1,21 @@
 # hirnok
 
-A fast, minimal NATS messaging library for Go.
+A small Go library for NATS handlers with bounded queues, worker pools, and
+JetStream ack handling.
 
-**Status:** early. API is not yet stable. Core NATS + JetStream pub/sub work; auth, tracing hooks, retry middleware, KV/Object store, and similar are deliberately out of scope until needed.
+**Status:** early. The API is still pre-v1.
 
-## Why
+## What It Is
 
-Most messaging abstractions in Go pile on router + middleware + envelope + publisher/subscriber adapters when all you actually need is "connect, register a handler." `hirnok` is the thin layer that does only that — and pairs each subscription with a bounded queue and a small worker pool, so you get backpressure and concurrency without writing them yourself.
+`hirnok` is intentionally thin:
 
-Design rules:
-
-- **No envelopes.** Handlers receive `*Message` (which embeds `*nats.Msg`) or `*JetMessage` (which embeds `jetstream.Msg`). Whatever schema you want lives in your code.
-- **No copies.** Pointers and interface values pass through unchanged from the NATS client to your handler.
-- **No router, no middleware chain.** Wrap your own handler if you want retry/tracing/DLQ.
-- **Context tracks the ack window.** For JetStream, the handler's `ctx` cancels just before server-side `AckWait` would redeliver. Respect `ctx` and your work stops doing redundant effort on slow handlers.
+- Handlers receive native NATS types: `*nats.Msg` for core NATS and
+  `jetstream.Msg` for JetStream.
+- Every subscription or consumer owns a bounded queue and a worker pool.
+- JetStream handlers get a context tied to `AckWait`, so slow work can stop
+  before the server redelivers the message.
+- Middleware is plain function wrapping. There is no router or custom envelope
+  type in the core API.
 
 ## Install
 
@@ -21,406 +23,357 @@ Design rules:
 go get github.com/rlsvr/hirnok
 ```
 
-Requires Go 1.26+.
+Requires Go 1.25+.
 
 ## Packages
 
-| Path             | What it is                                                          |
-|------------------|---------------------------------------------------------------------|
-| `pkg/queue`      | Bounded generic FIFO `Queue[T]` — the building block.                |
-| `pkg/worker`     | Generic worker pool that drains a `Queue[T]` into a dispatch func.   |
-| `pkg/nats`       | NATS connection + subscribe/publish + JetStream consumer/publisher. |
-| `pkg/middleware` | Composable handler decorators: `Recover`, `Retry`, `Trace`, `TraceJet`. |
+| Package | Purpose |
+|---|---|
+| `pkg/nats` | NATS connection, core subscribe/publish, JetStream publish/consume. |
+| `pkg/queue` | Bounded generic FIFO queue. |
+| `pkg/worker` | Generic worker pool over a queue. |
+| `pkg/middleware` | Handler decorators: recover, retry, DLQ. |
+| `pkg/middleware/otel` | OpenTelemetry decorators and header carrier. |
 
-`pkg/queue` and `pkg/worker` are usable on their own — you don't need NATS to get value out of them. Example:
-
-```go
-q := queue.New[Job](64)
-pool := worker.Run(ctx, 4, q, func(ctx context.Context, j Job) {
-    j.Do(ctx)
-})
-
-// ... produce ...
-_ = q.Push(ctx, Job{...})
-
-// shutdown:
-q.Close()
-_ = pool.Wait(ctx)
-```
-
-## Quick start
-
-### Core NATS
+## Core NATS
 
 ```go
 import (
     "context"
+    "log"
+
+    natsio "github.com/nats-io/nats.go"
     qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 conn, err := qpnats.Connect(qpnats.Config{
     URL:       "nats://localhost:4222",
-    Name:      "my-service",
+    Name:      "orders-api",
     QueueSize: 64,
     Workers:   4,
 })
-if err != nil { panic(err) }
+if err != nil {
+    panic(err)
+}
 defer conn.Close()
 
-sub, _ := conn.Subscribe(ctx, "events.*", func(ctx context.Context, m *qpnats.Message) error {
-    // m embeds *nats.Msg — m.Data, m.Subject, m.Header all work directly.
-    log.Printf("got %s on %s", m.Data, m.Subject)
+sub, err := conn.Subscribe(ctx, "orders.*", func(ctx context.Context, m *natsio.Msg) error {
+    log.Printf("subject=%s body=%s", m.Subject, m.Data)
     return nil
 })
-defer sub.Unsubscribe()
+if err != nil {
+    panic(err)
+}
+defer sub.Stop()
 
-_ = conn.Publish("events.user.signup", []byte(`{"id":1}`))
+_ = conn.Publish("orders.created", []byte(`{"id":"ord_1"}`))
 ```
 
-Graceful shutdown:
+Use `PublishMsg` when you need headers or reply subjects:
 
 ```go
-sub.Unsubscribe()                                  // stop accepting new messages
-ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-defer cancel()
-_ = sub.Wait(ctx)                                  // block until workers actually exit
+msg := &natsio.Msg{
+    Subject: "orders.created",
+    Data:    payload,
+    Header:  natsio.Header{},
+}
+msg.Header.Set("X-Request-Id", requestID)
+
+if err := conn.PublishMsg(msg); err != nil {
+    return err
+}
 ```
 
-`Sub.Wait` and `Consumer.Wait` block until every worker goroutine has returned (after its current handler call completes). `Stopped() <-chan struct{}` is the same signal as a channel for use in your own `select`.
+## JetStream
 
-### JetStream
+Create or fetch streams with `js.Raw()` when you need the underlying nats.go
+JetStream API:
 
 ```go
-js, _ := conn.JetStream()
+js, err := conn.JetStream()
+if err != nil {
+    panic(err)
+}
 
-// Pre-create the stream once (or do it elsewhere).
 _, _ = js.Raw().CreateOrUpdateStream(ctx, jetstream.StreamConfig{
     Name:     "ORDERS",
     Subjects: []string{"orders.>"},
 })
+```
 
-cons, err := js.Consume(ctx, "ORDERS", jetstream.ConsumerConfig{
+### Pull Consumer
+
+`NewConsumer` creates or updates a pull consumer, starts delivery, and runs the
+handler through hirnok's queue and worker pool.
+
+```go
+cons, err := js.NewConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
     Durable:       "orders-worker",
     FilterSubject: "orders.>",
     AckWait:       30 * time.Second,
-}, func(ctx context.Context, m *qpnats.JetMessage) error {
-    // m embeds jetstream.Msg — m.Data(), m.Subject(), m.Ack() all work.
-    // Return nil → Ack. Return err → Nak. ctx-expired → neither (server redelivers).
-    return process(ctx, m.Data())
+}, func(ctx context.Context, m jetstream.Msg) error {
+    return processOrder(ctx, m.Data())
 })
-if err != nil { panic(err) }
+if err != nil {
+    panic(err)
+}
 defer cons.Stop()
-
-ack, _ := js.Publish(ctx, "orders.new", []byte(`{"id":1}`))
-log.Printf("stored at seq=%d", ack.Sequence)
 ```
 
-### Context & AckWait
+### Push Consumer
 
-JetStream handlers receive a `ctx` that cancels **before** server-side `AckWait` expires (default: cancel at `AckWait - AckWait/10`; tunable via `Config.AckBuffer`). Two reasons:
+`NewPushConsumer` creates or updates a push consumer and uses the same handler,
+queue, worker, and ack path as `NewConsumer`.
 
-1. When `ctx` expires, the wrapper *doesn't* call Ack or Nak — it lets the server redeliver naturally. No double-processing collision.
-2. Downstream callees (DB, HTTP, pipelines) bail out via the same `ctx`, so a 5-minute-old in-flight handler doesn't keep hammering the DB while the redelivered copy is already running on another worker.
+Set `DeliverSubject` and `DeliverGroup` when you want stable queue-style push
+delivery across service instances. If `DeliverSubject` is empty, hirnok uses a
+generated NATS inbox, which is convenient for single-process consumers.
 
-Handlers must thread `ctx` through. Standard Go practice; just don't ignore it.
+```go
+cons, err := js.NewPushConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+    Durable:        "orders-push",
+    DeliverSubject: "orders.deliver",
+    DeliverGroup:   "orders-workers",
+    FilterSubject:  "orders.>",
+    AckWait:        30 * time.Second,
+}, func(ctx context.Context, m jetstream.Msg) error {
+    return processOrder(ctx, m.Data())
+})
+if err != nil {
+    panic(err)
+}
+defer cons.Stop()
+```
 
-For core NATS there's no AckWait, so the handler `ctx` is the parent subscription ctx — it cancels only on `Unsubscribe`, `Close`, or parent cancel.
+### Publishing
 
-## Concurrency
+```go
+ack, err := js.Publish(ctx, "orders.created", payload)
+if err != nil {
+    return err
+}
+log.Printf("stored at stream sequence %d", ack.Sequence)
+```
 
-`Config.Workers` sets the per-subscription worker count. Each subscription owns a bounded `pkg/queue` and that many goroutines drain it concurrently. Use `Workers: 1` for strict serial processing; higher values fan out at the cost of FIFO completion order.
+Use `PublishMsg` when you need JetStream headers such as dedupe IDs:
+
+```go
+msg := &natsio.Msg{
+    Subject: "orders.created",
+    Data:    payload,
+    Header:  natsio.Header{},
+}
+msg.Header.Set(jetstream.MsgIDHeader, orderID)
+
+ack, err := js.PublishMsg(ctx, msg)
+```
+
+## Ack Semantics
+
+JetStream handlers return errors to control the final ack action:
+
+| Handler result | JetStream action | Meaning |
+|---|---|---|
+| `nil` | `Ack()` | Message handled. |
+| `nats.ErrSkip` | `Ack()` | Drop intentionally without DLQ. |
+| `nats.ErrTerminate` | `Term()` | Permanent failure, no redelivery. |
+| Any other error | `Nak()` | Redeliver according to consumer policy. |
+| Handler context expired | no ack action | Let server redeliver after `AckWait`. |
+
+`AckPolicy` defaults to `AckExplicitPolicy` and `AckWait` defaults to 30s when
+they are not set on the consumer config.
+
+The handler context timeout is calculated from `AckWait - AckBuffer`. If
+`AckBuffer` is not set, hirnok uses a small default buffer. Pass the context to
+database, HTTP, and other downstream calls so work stops when the message is
+about to be redelivered.
+
+## Concurrency And Lifecycle
+
+Connection-level defaults:
+
+```go
+conn, _ := qpnats.Connect(qpnats.Config{
+    URL:       "nats://localhost:4222",
+    QueueSize: 128,
+    Workers:   8,
+    AckBuffer: 2 * time.Second,
+    NATSOptions: []natsio.Option{
+        natsio.MaxReconnects(-1),
+    },
+})
+```
+
+Override queue and worker settings per subscription or consumer:
+
+```go
+sub, err := conn.Subscribe(ctx, "events.*", handle,
+    qpnats.WithQueueSize(256),
+    qpnats.WithWorkers(4),
+)
+
+cons, err := js.NewConsumer(ctx, "ORDERS", cfg, handleJet,
+    qpnats.WithQueueSize(512),
+    qpnats.WithWorkers(16),
+    qpnats.WithAckBuffer(2*time.Second),
+)
+```
+
+Lifecycle methods:
+
+| Method | Behavior |
+|---|---|
+| `Stop()` | Stop delivery, cancel workers, return immediately. |
+| `Drain(ctx)` | Stop new delivery, finish queued and in-flight work, wait. |
+| `Wait(ctx)` | Wait until worker goroutines exit. |
+| `Stopped()` | Channel closed when workers exit. |
+| `Conn.Close()` | Stop registered subscriptions/consumers and close NATS. |
+| `Conn.Shutdown(ctx)` | Drain registered subscriptions/consumers, then drain NATS. |
+
+`Unsubscribe()` is kept as an alias for `Sub.Stop()`.
 
 ## Middleware
 
-Handlers are functions, so "middleware" is just `func(Handler) Handler`. `pkg/middleware` provides composable decorators — compose by nesting or assigning, no framework needed.
+Handlers are functions, so middleware is just function composition.
 
 ```go
 import qpmw "github.com/rlsvr/hirnok/pkg/middleware"
 
 h := qpmw.Recover(
-    qpmw.Retry(myHandler, 3, 100*time.Millisecond, 5*time.Second, nil),
+    qpmw.Retry(handle, 3, 100*time.Millisecond, 5*time.Second, nil),
 )
-conn.Subscribe(ctx, "foo", h)
+
+sub, err := conn.Subscribe(ctx, "events.*", h)
 ```
 
-Or imperatively when you have more than two layers:
+`Recover` catches panics and returns them as handler errors.
+
+`Retry` retries handler errors with exponential backoff. The default retry
+filter skips `context.Canceled`, `context.DeadlineExceeded`,
+`nats.ErrSkip`, and `nats.ErrTerminate`.
+
+`DLQ` and `DLQJet` publish failed messages to a dead-letter subject with
+diagnostic headers:
 
 ```go
-h := myHandler
-h = qpmw.Recover(h)
-h = qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, nil)
-h = qpmw.Trace(h, tracer)
+h := qpmw.Recover(
+    qpmw.DLQJet(handleOrder, js, "orders.dlq", nil),
+)
+
+cons, err := js.NewConsumer(ctx, "ORDERS", cfg, h)
 ```
 
-**`Recover`** catches panics in the handler and returns them as errors so a misbehaving handler doesn't take down the worker goroutine.
+Default DLQ filtering sends normal errors to DLQ and skips context cancellation,
+deadline expiry, and `ErrSkip`. `ErrTerminate` is DLQ-worthy by default.
 
-**`Retry`** retries on error with exponential backoff capped at `maxBackoff`. The `shouldRetry` filter decides which errors are retryable; pass `nil` for the default (retry everything except `context.Canceled` / `context.DeadlineExceeded`). Backoff sleeps respect ctx, so on JetStream the retry exits cleanly when the handler's AckWait-derived ctx expires. Note: put `Recover` *inside* `Retry` if you want panics to trigger retries — `Retry` only sees errors, not panics.
+For poison payloads, wrap `ErrTerminate` so the original message is not retried:
 
-`Recover` and `Retry` are generic — they work with `qpnats.Handler`, `qpnats.JetHandler`, or any function of shape `func(context.Context, M) error`. Go infers the message type from the handler you pass in.
+```go
+func handleOrder(ctx context.Context, m jetstream.Msg) error {
+    var event OrderEvent
+    if err := json.Unmarshal(m.Data(), &event); err != nil {
+        return fmt.Errorf("decode order event: %w", qpnats.ErrTerminate)
+    }
+    if err := event.Validate(); err != nil {
+        return fmt.Errorf("validate order event: %w", qpnats.ErrTerminate)
+    }
+    return processOrder(ctx, event)
+}
+```
 
-### Tracing (OpenTelemetry)
+## OpenTelemetry
 
-`Trace` / `TraceJet` wrap a handler with a `hirnok.handle` OTel span. They:
-
-- extract the upstream W3C `traceparent`/`tracestate` from `msg.Header` so the new span continues the caller's trace;
-- attach `messaging.*` semconv attributes (`system=nats`, `destination`, `operation=process`, `message.id`, `body.size`);
-- record handler errors as span errors;
-- make the span available to the handler via `ctx` — call `trace.SpanFromContext(ctx)` to add your own attributes.
+Tracing lives in `pkg/middleware/otel` so the base middleware package does not
+pull OpenTelemetry dependencies into applications that do not use them.
 
 ```go
 import (
     qpmw "github.com/rlsvr/hirnok/pkg/middleware"
+    qpotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
     "go.opentelemetry.io/otel"
 )
 
-tracer := otel.Tracer("my-service")
-h := qpmw.Recover(qpmw.Trace(myHandler, tracer))
-conn.Subscribe(ctx, "events.*", h)
+tracer := otel.Tracer("orders-api")
+h := qpmw.Recover(qpotel.TraceJet(handleOrder, tracer))
+
+cons, err := js.NewConsumer(ctx, "ORDERS", cfg, h)
 ```
 
-For publish-side tracing, inject the current ctx into outgoing headers yourself — five lines, no wrapper type needed:
+For publish-side tracing, inject into the native NATS headers:
 
 ```go
-import "go.opentelemetry.io/otel/codes"
-
-m := &nats.Msg{Subject: "events.user.signup", Data: payload, Header: nats.Header{}}
-ctx, span := tracer.Start(ctx, "hirnok.publish")
+msg := &natsio.Msg{Subject: "orders.created", Data: payload, Header: natsio.Header{}}
+ctx, span := tracer.Start(ctx, "nats.publish")
 defer span.End()
-otel.GetTextMapPropagator().Inject(ctx, qpmw.HeaderCarrier{Header: m.Header})
-if err := conn.PublishMsg(&qpnats.Message{Msg: m}); err != nil {
-    span.RecordError(err); span.SetStatus(codes.Error, err.Error())
-}
+
+otel.GetTextMapPropagator().Inject(ctx, qpotel.HeaderCarrier{Header: msg.Header})
+_, err := js.PublishMsg(ctx, msg)
 ```
 
-### Sentinel errors
+## Custom Subscribers
 
-Two sentinels in `pkg/nats` give handlers a shared vocabulary for "don't redeliver this":
-
-- **`nats.ErrTerminate`** — handler failed permanently; don't retry, send to DLQ. The JetStream dispatcher acks (no more redelivery). The default `Retry` shouldRetry skips it. The default `DLQ` shouldDLQ matches it. Wrap a domain error to surface a useful reason in DLQ headers:
-  ```go
-  return fmt.Errorf("bad payload: %w", nats.ErrTerminate)
-  ```
-
-- **`nats.ErrSkip`** — handler decided the message is irrelevant; ack and drop silently. No retry, no DLQ. JetStream acks; DLQ short-circuits without publishing.
-
-Sentinel-aware components see them via `errors.Is`, so callers can wrap them with their own domain errors and everything still works.
-
-### Handler patterns: unmarshal and validate
-
-hirnok intentionally does **not** ship a generic `Decode[T]` middleware. Unmarshaling a wire payload into your envelope type, validating it, and signaling permanent failure are four lines of handler code — and putting them in the handler keeps the typed value local where you'll actually use it, with no extra generic machinery to learn.
-
-The canonical pattern, using `nats.ErrTerminate` to route bad data to DLQ instead of retry:
+`NewConsumer` and `NewPushConsumer` are convenient built-ins. If you need a
+different source, such as a custom pull batch loop, partitioned delivery, or an
+in-process test source, use the lower-level pieces directly.
 
 ```go
-type OrderEvent struct {
-    OrderID string `json:"order_id"`
-    Amount  int    `json:"amount"`
-}
+q := queue.New[jetstream.Msg](64)
 
-func (e *OrderEvent) Validate() error {
-    if e.OrderID == "" { return errors.New("missing order_id") }
-    if e.Amount <= 0   { return errors.New("amount must be positive") }
-    return nil
-}
-
-func handleOrder(ctx context.Context, m *qpnats.JetMessage) error {
-    var env OrderEvent
-    if err := json.Unmarshal(m.Data(), &env); err != nil {
-        return fmt.Errorf("unmarshal: %w", qpnats.ErrTerminate)
-    }
-    if err := env.Validate(); err != nil {
-        return fmt.Errorf("validate: %w", qpnats.ErrTerminate)
-    }
-    return processOrder(ctx, &env)
-}
-
-h := qpmw.RecoverJet(qpmw.DLQJet(handleOrder, js, "orders.dlq", nil))
-js.Consume(ctx, "ORDERS", cfg, h)
-```
-
-What happens on each path:
-
-- **Valid payload** → handler returns nil → JetStream acks.
-- **Malformed JSON** → `ErrTerminate`-wrapped error → `Retry` (if present) skips retry → `DLQJet` publishes to `orders.dlq` → wrapper returns nil → JetStream acks. No infinite redelivery loop on poison data.
-- **Validation failure** → same as above.
-- **Transient downstream error** (DB down, etc.) → handler returns a plain error → `Retry` retries → on exhaustion, `DLQJet` catches the final error.
-
-Same pattern works on core NATS — swap `*qpnats.JetMessage` for `*qpnats.Message`, swap `m.Data()` for `m.Data`, and use `qpmw.Recover` / `qpmw.DLQ` instead of the Jet variants.
-
-### DLQ (dead-letter queue)
-
-`DLQ` (core) and `DLQJet` (JetStream) wrap a handler so failed messages get republished to a dead-letter subject with diagnostic headers attached:
-
-| Header | Value |
-|---|---|
-| `Hirnok-DLQ-Reason` | `err.Error()` |
-| `Hirnok-DLQ-Subject` | original subject |
-| `Hirnok-DLQ-At` | RFC3339 timestamp |
-
-Original headers (traceparent, custom metadata) are preserved. The wrapped handler returns nil on a successful DLQ publish so the caller acks the original message.
-
-```go
-// Plain: every error → DLQ after retries exhaust
-h := qpmw.DLQJet(qpmw.RetryJet(myHandler, 3, 100*time.Millisecond, 5*time.Second, nil),
-    js, "events.dlq", nil)
-
-// Filtered: only specific errors go to DLQ
-isSchemaError := func(err error) bool { return errors.Is(err, ErrSchema) }
-h := qpmw.DLQJet(myHandler, js, "schema.dlq", isSchemaError)
-
-// Terminate-bypass-retry: handler signals "don't retry, just DLQ"
-//   in handler:   return fmt.Errorf("bad: %w", nats.ErrTerminate)
-//   in wiring:
-h := qpmw.RetryJet(qpmw.DLQJet(myHandler, js, "events.dlq", nil), 3, ...)
-//   Retry's default shouldRetry skips ErrTerminate; DLQJet publishes
-//   and returns nil; Retry sees nil and doesn't loop.
-```
-
-Default `shouldDLQ` routes everything to DLQ *except* `ErrSkip`, `context.Canceled`, and `context.DeadlineExceeded` — those indicate "try again later," not "the data is poison."
-
-If the DLQ publish itself fails, the wrapper returns a joined error (original + publish error) so the outer redelivery path can retry. For JetStream DLQs, make sure the DLQ subject is covered by a stream of its own so DLQ messages are durable.
-
-### Composition: DLQ inside vs outside Retry
-
-- **Outside** (`DLQ(Retry(h))`): only the *final* post-retry failure is DLQ'd. Use when retries are worth trying first.
-- **Inside** (`Retry(DLQ(h))`): each failed attempt is DLQ'd — but DLQ swallows the error so Retry sees nil and doesn't loop. Use for fast-fail patterns where retries are pointless (e.g., handler returns `ErrTerminate`).
-
-### Custom subscribers (advanced)
-
-`JetStream.Consume` is one convenient wiring of a NATS-side subscriber → bounded queue → worker pool → dispatch with ack/nak. When you need a different subscriber — partitioned consumption, a pull-consumer batch loop, an in-process test source, anything — wire it yourself using the same building blocks. `DispatchJet` exposes the per-message dispatch (timeout-bounded ctx, ack on nil, nak on plain error, ack on `ErrTerminate`/`ErrSkip`) so your worker pool inherits the same semantics as the built-in path.
-
-```go
-import (
-    "context"
-    qpnats "github.com/rlsvr/hirnok/pkg/nats"
-    qpmw   "github.com/rlsvr/hirnok/pkg/middleware"
-    "github.com/rlsvr/hirnok/pkg/queue"
-    "github.com/rlsvr/hirnok/pkg/worker"
-    "github.com/nats-io/nats.go/jetstream"
-)
-
-const (
-    queueSize  = 64
-    workers    = 4
-    ackTimeout = 25 * time.Second // typically AckWait - AckBuffer
-)
-
-ctx, cancel := context.WithCancel(parent)
-defer cancel()
-
-q := queue.New[*qpnats.JetMessage](queueSize)
-
-// Your custom subscriber — anything that delivers jetstream.Msg values
-// into a callback. Returns a stop function for graceful shutdown.
-stopSource, err := mySource.Subscribe(func(m jetstream.Msg) {
-    _ = q.Push(ctx, &qpnats.JetMessage{Msg: m})
+pool := worker.Run(ctx, 4, q, func(ctx context.Context, m jetstream.Msg) {
+    qpnats.DispatchJet(ctx, handle, m, 25*time.Second)
 })
-if err != nil { /* handle */ }
+
+stopSource, err := mySource.Subscribe(func(m jetstream.Msg) {
+    _ = q.Push(ctx, m)
+})
+if err != nil {
+    return err
+}
 defer stopSource()
 
-// Compose your handler with hirnok middleware as usual.
-h := qpmw.RecoverJet(qpmw.DLQJet(myHandler, js, "events.dlq", nil))
-
-// hirnok's worker pool drains the queue and runs DispatchJet — same
-// ack/nak semantics as JetStream.Consume.
-pool := worker.Run(ctx, workers, q, func(ctx context.Context, m *qpnats.JetMessage) {
-    qpnats.DispatchJet(ctx, h, m, ackTimeout)
-})
-
-// Shutdown: cancel ctx (stops the source via the closure above and the
-// pool), close the queue, Wait for in-flight handlers.
-cancel()
+// shutdown
 q.Close()
 _ = pool.Wait(shutdownCtx)
 ```
 
-The recipe is ~10 lines of caller code plus your subscriber implementation. You keep full control over the source lifecycle; hirnok provides the dispatch and middleware composition.
-
-For core NATS handlers (no ack semantics), the equivalent worker dispatch is just `_ = h(ctx, m)` — there's no exported helper because there's nothing for it to wrap.
-
-### Wiring multiple handlers
-
-There's no `Router` in hirnok on purpose. If you want one central place to register handlers, apply a default middleware chain, and shut everything down together, that's about 25 lines of caller code:
-
-```go
-type Setup struct {
-    Conn   *qpnats.Conn
-    Tracer trace.Tracer
-    subs   []*qpnats.Sub
-}
-
-func (s *Setup) wrap(h qpnats.Handler) qpnats.Handler {
-    h = qpmw.Trace(h, s.Tracer)
-    h = qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, nil)
-    h = qpmw.Recover(h)
-    return h
-}
-
-func (s *Setup) Sub(ctx context.Context, subject string, h qpnats.Handler) error {
-    sub, err := s.Conn.Subscribe(ctx, subject, s.wrap(h))
-    if err != nil {
-        return err
-    }
-    s.subs = append(s.subs, sub)
-    return nil
-}
-
-func (s *Setup) Stop(ctx context.Context) error {
-    for _, sub := range s.subs {
-        _ = sub.Unsubscribe()
-    }
-    for _, sub := range s.subs {
-        if err := sub.Wait(ctx); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-Same idea works for JetStream — add a `JS *qpnats.JetStream` field, a parallel `Consume` method, and track `[]*qpnats.Consumer`. The point is: this is *your* glue, shaped to *your* app. We don't impose a Router on you.
+For core NATS handlers there is no exported dispatch helper because there is no
+ack/nak/term behavior to centralize. A worker can call `_ = h(ctx, msg)`
+directly.
 
 ## Development
 
 ```bash
-make build              # go build ./...
-make test               # go test -race ./...
-make test-verbose       # ...with -v
-make lint               # golangci-lint run ./...
-make fmt                # golangci-lint fmt
-make lint-fix           # golangci-lint run --fix
-make tidy               # go mod tidy
-make check              # fmt + lint + tidy
+make build               # go build ./...
+make test                # go test -race ./...
+make test-verbose        # go test -race -v ./...
+make lint                # golangci-lint run ./...
+make fmt                 # golangci-lint fmt
+make tidy                # go mod tidy
+make check               # fmt + lint + tidy
 ```
 
-Tests use an embedded `nats-server` (no external broker needed). The full suite — including JetStream redelivery, dedupe, ack-window timing — runs in a few seconds.
+Unit tests start an embedded `nats-server`.
 
-## Smoke & stress
-
-Programs in `test/` exercise the library against a **real** NATS broker (not the embedded one), useful for catching regressions that only show up against a real server and for measuring throughput.
+Smoke and stress programs in `test/` run against a real broker:
 
 ```bash
-make nats               # start dockerized nats-server -js (Ctrl-C to stop)
-
-# in another terminal:
-make smoke              # core + JS round-trip; exits non-zero on failure
-make stress-core        # producers × workers × messages throughput
-make stress-jetstream   # JS publish + consume throughput
-make stress-backpressure # slow handler / fast producer; verifies clean shutdown
-make stress-burst       # cold-idle → burst; measures first-msg latency + drain
-make stress             # run all four sequentially
-make nats-stop          # tear down the broker
+make nats                # start dockerized nats-server -js
+make smoke               # core + JetStream round trip
+make stress-core
+make stress-jetstream
+make stress-backpressure
+make stress-burst
+make stress
+make nats-stop
 ```
 
-Each stress bench takes flags — e.g. `go run ./test/stress/core --producers 8 --workers 16 --messages 1000000`. See each program's `--help`.
+## Scope
 
-`test/setup.sh` uses Docker by default (`nats:latest`). Set `USE_BINARY=1` to use a locally-installed `nats-server` instead.
+Currently out of scope:
 
-## What's intentionally not here (yet)
-
-- Auth: nkeys, creds files, tokens. Add to `Config` when needed.
-- Tracing / metrics hooks. Wrap your handler.
-- Retry middleware / dead-letter helpers. Wrap your handler.
-- `Term` semantics (a sentinel `ErrTerminate` is the planned door).
-- Pull-consumer batch fetch (`Fetch`) for high throughput.
-- KV and Object Store wrappers — `js.Raw()` gives you the underlying jetstream context if you need them today.
+- Router framework.
+- Custom message envelope.
+- Auth-specific config helpers. Use `Config.NATSOptions` today.
+- KV and Object Store wrappers. Use `js.Raw()` today.
+- Pull batch `Fetch` helpers. Use nats.go directly or `DispatchJet` with your
+  own source loop.

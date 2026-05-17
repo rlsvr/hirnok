@@ -9,9 +9,9 @@
 //	h := middleware.Recover(middleware.Retry(myHandler, 3, ...))
 //	conn.Subscribe(ctx, "foo", h)
 //
-// Recover and Retry are fully generic and have zero dependency on
-// pkg/nats. The OpenTelemetry tracing helpers (Trace, TraceJet) live in
-// tracing.go and import pkg/nats since they need to read NATS headers.
+// Recover and Retry are fully generic. OpenTelemetry tracing helpers live in
+// pkg/middleware/otel so callers only pull OTel dependencies when they need
+// them.
 package middleware
 
 import (
