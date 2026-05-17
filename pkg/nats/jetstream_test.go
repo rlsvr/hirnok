@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -505,6 +506,99 @@ func assertSentinelAcked(t *testing.T, returnErr func() error, stream, subjectPa
 	if info.NumAckPending != 0 || info.NumPending != 0 {
 		t.Fatalf("ackPending=%d pending=%d, want 0/0", info.NumAckPending, info.NumPending)
 	}
+}
+
+// dispatchStub is a jetstream.Msg stub that records Ack/Nak calls so we
+// can verify DispatchJet's behavior directly, without spinning up a real
+// JS consumer.
+type dispatchStub struct {
+	jetstream.Msg
+	mu       sync.Mutex
+	acked    int
+	naked    int
+	ackDelay time.Duration // optional sleep inside Ack (for ctx-expiry test)
+}
+
+func (s *dispatchStub) Ack() error {
+	if s.ackDelay > 0 {
+		time.Sleep(s.ackDelay)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.acked++
+	return nil
+}
+
+func (s *dispatchStub) Nak() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.naked++
+	return nil
+}
+
+func (s *dispatchStub) snapshot() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acked, s.naked
+}
+
+func TestDispatchJetDirect(t *testing.T) {
+	t.Run("nil_error_acks", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ *JetMessage) error { return nil }
+		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
+		a, n := stub.snapshot()
+		if a != 1 || n != 0 {
+			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		}
+	})
+
+	t.Run("plain_error_naks", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ *JetMessage) error { return errors.New("boom") }
+		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
+		a, n := stub.snapshot()
+		if a != 0 || n != 1 {
+			t.Fatalf("acks=%d naks=%d, want 0 1", a, n)
+		}
+	})
+
+	t.Run("err_terminate_acks", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ *JetMessage) error {
+			return fmt.Errorf("bad: %w", ErrTerminate)
+		}
+		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
+		a, n := stub.snapshot()
+		if a != 1 || n != 0 {
+			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		}
+	})
+
+	t.Run("err_skip_acks", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ *JetMessage) error { return ErrSkip }
+		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, time.Second)
+		a, n := stub.snapshot()
+		if a != 1 || n != 0 {
+			t.Fatalf("acks=%d naks=%d, want 1 0", a, n)
+		}
+	})
+
+	t.Run("ctx_expired_no_action", func(t *testing.T) {
+		stub := &dispatchStub{}
+		// Handler observes its ctx expiring and returns its err; dispatch
+		// sees ctx.Err() != nil and does nothing (neither Ack nor Nak).
+		h := func(ctx context.Context, _ *JetMessage) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		DispatchJet(context.Background(), h, &JetMessage{Msg: stub}, 10*time.Millisecond)
+		a, n := stub.snapshot()
+		if a != 0 || n != 0 {
+			t.Fatalf("acks=%d naks=%d, want 0 0 (ctx expiry → no ack action)", a, n)
+		}
+	})
 }
 
 func TestPerMessageTimeoutDefaults(t *testing.T) {

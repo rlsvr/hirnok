@@ -205,6 +205,48 @@ Two sentinels in `pkg/nats` give handlers a shared vocabulary for "don't redeliv
 
 Sentinel-aware components see them via `errors.Is`, so callers can wrap them with their own domain errors and everything still works.
 
+### Handler patterns: unmarshal and validate
+
+hirnok intentionally does **not** ship a generic `Decode[T]` middleware. Unmarshaling a wire payload into your envelope type, validating it, and signaling permanent failure are four lines of handler code — and putting them in the handler keeps the typed value local where you'll actually use it, with no extra generic machinery to learn.
+
+The canonical pattern, using `nats.ErrTerminate` to route bad data to DLQ instead of retry:
+
+```go
+type OrderEvent struct {
+    OrderID string `json:"order_id"`
+    Amount  int    `json:"amount"`
+}
+
+func (e *OrderEvent) Validate() error {
+    if e.OrderID == "" { return errors.New("missing order_id") }
+    if e.Amount <= 0   { return errors.New("amount must be positive") }
+    return nil
+}
+
+func handleOrder(ctx context.Context, m *qpnats.JetMessage) error {
+    var env OrderEvent
+    if err := json.Unmarshal(m.Data(), &env); err != nil {
+        return fmt.Errorf("unmarshal: %w", qpnats.ErrTerminate)
+    }
+    if err := env.Validate(); err != nil {
+        return fmt.Errorf("validate: %w", qpnats.ErrTerminate)
+    }
+    return processOrder(ctx, &env)
+}
+
+h := qpmw.RecoverJet(qpmw.DLQJet(handleOrder, js, "orders.dlq", nil))
+js.Consume(ctx, "ORDERS", cfg, h)
+```
+
+What happens on each path:
+
+- **Valid payload** → handler returns nil → JetStream acks.
+- **Malformed JSON** → `ErrTerminate`-wrapped error → `Retry` (if present) skips retry → `DLQJet` publishes to `orders.dlq` → wrapper returns nil → JetStream acks. No infinite redelivery loop on poison data.
+- **Validation failure** → same as above.
+- **Transient downstream error** (DB down, etc.) → handler returns a plain error → `Retry` retries → on exhaustion, `DLQJet` catches the final error.
+
+Same pattern works on core NATS — swap `*qpnats.JetMessage` for `*qpnats.Message`, swap `m.Data()` for `m.Data`, and use `qpmw.Recover` / `qpmw.DLQ` instead of the Jet variants.
+
 ### DLQ (dead-letter queue)
 
 `DLQ` (core) and `DLQJet` (JetStream) wrap a handler so failed messages get republished to a dead-letter subject with diagnostic headers attached:
@@ -242,6 +284,59 @@ If the DLQ publish itself fails, the wrapper returns a joined error (original + 
 
 - **Outside** (`DLQ(Retry(h))`): only the *final* post-retry failure is DLQ'd. Use when retries are worth trying first.
 - **Inside** (`Retry(DLQ(h))`): each failed attempt is DLQ'd — but DLQ swallows the error so Retry sees nil and doesn't loop. Use for fast-fail patterns where retries are pointless (e.g., handler returns `ErrTerminate`).
+
+### Custom subscribers (advanced)
+
+`JetStream.Consume` is one convenient wiring of a NATS-side subscriber → bounded queue → worker pool → dispatch with ack/nak. When you need a different subscriber — partitioned consumption, a pull-consumer batch loop, an in-process test source, anything — wire it yourself using the same building blocks. `DispatchJet` exposes the per-message dispatch (timeout-bounded ctx, ack on nil, nak on plain error, ack on `ErrTerminate`/`ErrSkip`) so your worker pool inherits the same semantics as the built-in path.
+
+```go
+import (
+    "context"
+    qpnats "github.com/rlsvr/hirnok/pkg/nats"
+    qpmw   "github.com/rlsvr/hirnok/pkg/middleware"
+    "github.com/rlsvr/hirnok/pkg/queue"
+    "github.com/rlsvr/hirnok/pkg/worker"
+    "github.com/nats-io/nats.go/jetstream"
+)
+
+const (
+    queueSize  = 64
+    workers    = 4
+    ackTimeout = 25 * time.Second // typically AckWait - AckBuffer
+)
+
+ctx, cancel := context.WithCancel(parent)
+defer cancel()
+
+q := queue.New[*qpnats.JetMessage](queueSize)
+
+// Your custom subscriber — anything that delivers jetstream.Msg values
+// into a callback. Returns a stop function for graceful shutdown.
+stopSource, err := mySource.Subscribe(func(m jetstream.Msg) {
+    _ = q.Push(ctx, &qpnats.JetMessage{Msg: m})
+})
+if err != nil { /* handle */ }
+defer stopSource()
+
+// Compose your handler with hirnok middleware as usual.
+h := qpmw.RecoverJet(qpmw.DLQJet(myHandler, js, "events.dlq", nil))
+
+// hirnok's worker pool drains the queue and runs DispatchJet — same
+// ack/nak semantics as JetStream.Consume.
+pool := worker.Run(ctx, workers, q, func(ctx context.Context, m *qpnats.JetMessage) {
+    qpnats.DispatchJet(ctx, h, m, ackTimeout)
+})
+
+// Shutdown: cancel ctx (stops the source via the closure above and the
+// pool), close the queue, Wait for in-flight handlers.
+cancel()
+q.Close()
+_ = pool.Wait(shutdownCtx)
+```
+
+The recipe is ~10 lines of caller code plus your subscriber implementation. You keep full control over the source lifecycle; hirnok provides the dispatch and middleware composition.
+
+For core NATS handlers (no ack semantics), the equivalent worker dispatch is just `_ = h(ctx, m)` — there's no exported helper because there's nothing for it to wrap.
 
 ### Wiring multiple handlers
 

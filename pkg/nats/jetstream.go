@@ -104,7 +104,7 @@ func (j *JetStream) Consume(
 	}
 
 	pool := worker.Run(consCtx, j.cfg.workers(), q, func(parent context.Context, m *JetMessage) {
-		dispatchJet(parent, h, m, handlerTimeout)
+		DispatchJet(parent, h, m, handlerTimeout)
 	})
 
 	return &Consumer{
@@ -115,7 +115,22 @@ func (j *JetStream) Consume(
 	}, nil
 }
 
-func dispatchJet(parent context.Context, h JetHandler, m *JetMessage, timeout time.Duration) {
+// DispatchJet runs h on m with a per-message context derived from parent
+// (timeout = AckWait - AckBuffer when configured via JetStream.Consume),
+// then translates the handler's return into a JetStream ack action:
+//
+//   - handler returns nil → Ack
+//   - handler returns ErrSkip or ErrTerminate → Ack (explicit "don't redeliver")
+//   - handler returns any other error → Nak (server will redeliver)
+//   - per-message ctx expired before handler returns → no action (server
+//     has already redelivered or will after AckWait)
+//
+// JetStream.Consume uses this internally. It's exported so callers wiring
+// a custom subscriber — a partitioned consumer, a pull-consumer batch loop,
+// an in-process test source — can use it from their own worker pool and
+// get the same ack semantics. See the "Custom subscribers" section in the
+// README for the wiring recipe.
+func DispatchJet(parent context.Context, h JetHandler, m *JetMessage, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	err := h(ctx, m)
