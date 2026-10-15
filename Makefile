@@ -2,7 +2,7 @@ MODULE        := github.com/rlsvr/hirnok
 GOLANGCI_LINT := golangci-lint
 
 .PHONY: all build test test-verbose test-integration test-integration-verbose \
-	fmt lint lint-fix check tidy clean \
+	fmt lint lint-fix check tidy vulncheck clean \
 	nats nats-stop smoke stress stress-core stress-jetstream stress-backpressure stress-burst
 
 ## all: build + test + lint
@@ -46,6 +46,10 @@ tidy:
 
 ## check: fmt + lint + tidy
 check: fmt lint tidy
+
+## vulncheck: run govulncheck on all packages
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 ## clean: remove build artifacts
 clean:

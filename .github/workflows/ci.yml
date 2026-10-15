@@ -44,3 +44,17 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13
+
+  vulncheck:
+    name: Vulnerability Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-package: ./...
+          repo-checkout: 'false'
