@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/sethvargo/go-retry"
@@ -25,17 +26,55 @@ import (
 	qpnats "github.com/rlsvr/hirnok/pkg/nats"
 )
 
+// PanicError is returned by Recover when a handler panics. It contains the
+// original panic value and the stack trace captured at the point of recovery.
+type PanicError struct {
+	Value any
+	Stack []byte
+}
+
+func (p *PanicError) Error() string {
+	return fmt.Sprintf("panic in handler: %v\n%s", p.Value, p.Stack)
+}
+
+func (p *PanicError) Unwrap() error {
+	if err, ok := p.Value.(error); ok {
+		return err
+	}
+	return nil
+}
+
 // Recover wraps h so panics in the handler become errors instead of
-// crashing the worker goroutine. The panic value is formatted with %v
-// and surfaced as a plain error.
+// crashing the worker goroutine. The panic value and stack trace are
+// captured and returned as a *PanicError.
 func Recover[M any](h func(context.Context, M) error) func(context.Context, M) error {
 	return func(ctx context.Context, m M) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("panic in handler: %v", r)
+				err = &PanicError{
+					Value: r,
+					Stack: debug.Stack(),
+				}
 			}
 		}()
 		return h(ctx, m)
+	}
+}
+
+// Middleware wraps a handler function of type H.
+type Middleware[H any] func(H) H
+
+// Chain composes multiple middlewares into a single middleware.
+// Execution order is outer-to-inner (left-to-right):
+// Chain(m1, m2, m3)(h) produces m1(m2(m3(h))).
+func Chain[H any](mws ...Middleware[H]) Middleware[H] {
+	return func(final H) H {
+		for i := len(mws) - 1; i >= 0; i-- {
+			if mws[i] != nil {
+				final = mws[i](final)
+			}
+		}
+		return final
 	}
 }
 
@@ -68,32 +107,60 @@ func Retry[M any](
 		panic("middleware: Retry initialBackoff must be > 0")
 	}
 	if shouldRetry == nil {
-		shouldRetry = defaultShouldRetry
+		shouldRetry = DefaultShouldRetry
 	}
 
 	return func(ctx context.Context, m M) error {
+		err := h(ctx, m)
+		if err == nil || !shouldRetry(err) || attempts == 1 {
+			return err
+		}
+
 		b := retry.NewExponential(initialBackoff)
 		if maxBackoff > 0 {
 			b = retry.WithCappedDuration(maxBackoff, b)
 		}
 		b = retry.WithMaxRetries(uint64(attempts-1), b) //nolint:gosec // attempts > 0 validated above
 
-		return retry.Do(ctx, b, func(ctx context.Context) error {
-			err := h(ctx, m)
-			if err == nil {
-				return nil
+		for {
+			next, stop := b.Next()
+			if stop {
+				return err
 			}
-			if shouldRetry(err) {
-				return retry.RetryableError(err)
+			t := time.NewTimer(next)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
 			}
-			return err
-		})
+			err = h(ctx, m)
+			if err == nil || !shouldRetry(err) {
+				return err
+			}
+		}
 	}
 }
 
-func defaultShouldRetry(err error) bool {
-	if errors.Is(err, qpnats.ErrTerminate) || errors.Is(err, qpnats.ErrSkip) {
+// DefaultShouldRetry is hirnok's default retry filter. It retries all errors
+// EXCEPT context.Canceled, context.DeadlineExceeded, ErrTerminate, ErrSkip, and NakDelayError.
+func DefaultShouldRetry(err error) bool {
+	var nd *qpnats.NakDelayError
+	if errors.Is(err, qpnats.ErrTerminate) || errors.Is(err, qpnats.ErrSkip) || errors.As(err, &nd) {
 		return false
 	}
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// WithNonRetryable returns an error predicate that wraps DefaultShouldRetry and
+// additionally marks errors matching any of the provided checks as non-retryable.
+func WithNonRetryable(checks ...func(error) bool) func(error) bool {
+	return func(err error) bool {
+		for _, check := range checks {
+			if check != nil && check(err) {
+				return false
+			}
+		}
+		return DefaultShouldRetry(err)
+	}
 }

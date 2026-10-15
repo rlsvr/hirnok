@@ -47,11 +47,13 @@ func (s *stubJSMsg) Subject() string        { return s.subject }
 
 // ---------------- Trace ----------------
 
+const testSubject = "foo"
+
 func TestTraceStartsHandleSpan(t *testing.T) {
 	r, tracer := newRecorder()
 	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, tracer)
 
-	m := &natsio.Msg{Subject: "foo", Data: []byte("body"), Header: natsio.Header{}}
+	m := &natsio.Msg{Subject: testSubject, Data: []byte("body"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -73,7 +75,7 @@ func TestTraceRecordsErrorOnHandlerError(t *testing.T) {
 	sentinel := errors.New("nope")
 	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return sentinel }, tracer)
 
-	m := &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: natsio.Header{}}
+	m := &natsio.Msg{Subject: testSubject, Data: []byte("b"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want sentinel", err)
 	}
@@ -112,7 +114,7 @@ func TestTraceExtractsParent(t *testing.T) {
 	parentSpan.End()
 
 	h := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, tracer)
-	m := &natsio.Msg{Subject: "foo", Data: []byte("b"), Header: header}
+	m := &natsio.Msg{Subject: testSubject, Data: []byte("b"), Header: header}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -254,6 +256,53 @@ func attrsMap(kvs []attribute.KeyValue) map[string]any {
 		out[string(kv.Key)] = kv.Value.AsInterface()
 	}
 	return out
+}
+
+func TestInjectInitializesNilHeader(t *testing.T) {
+	_, tracer := newRecorder()
+	ctx, span := tracer.Start(context.Background(), "test-span")
+	defer span.End()
+
+	msg := &natsio.Msg{Subject: "orders.created", Data: []byte("payload")}
+	if msg.Header != nil {
+		t.Fatal("expected nil header initially")
+	}
+
+	Inject(ctx, msg)
+
+	if msg.Header == nil {
+		t.Fatal("expected msg.Header to be initialized")
+	}
+	if msg.Header.Get("traceparent") == "" {
+		t.Fatal("expected traceparent header to be injected")
+	}
+
+	extractedCtx := Extract(context.Background(), msg)
+	extractedSpan := trace.SpanFromContext(extractedCtx)
+	if extractedSpan.SpanContext().TraceID() != span.SpanContext().TraceID() {
+		t.Fatalf("trace ID mismatch: got %v, want %v", extractedSpan.SpanContext().TraceID(), span.SpanContext().TraceID())
+	}
+}
+
+func TestInjectNilMsgSafe(t *testing.T) {
+	// Must not panic on nil msg
+	Inject(context.Background(), nil)
+	ctx := Extract(context.Background(), nil)
+	if ctx == nil {
+		t.Fatal("Extract with nil msg returned nil ctx")
+	}
+}
+
+func TestHeaderCarrierSetNilHeaderDoesNotPanic(t *testing.T) {
+	c := HeaderCarrier{Header: nil}
+	// Setting on nil HeaderCarrier must be a safe no-op instead of panicking
+	c.Set("foo", "bar")
+	if c.Get("foo") != "" {
+		t.Fatalf("Get on nil carrier returned %q", c.Get("foo"))
+	}
+	if len(c.Keys()) != 0 {
+		t.Fatalf("Keys on nil carrier returned %v", c.Keys())
+	}
 }
 
 // silence unused import for time when tests are refactored.

@@ -3,8 +3,6 @@
 A small Go library for NATS handlers with bounded queues, worker pools, and
 JetStream ack handling.
 
-**Status:** early. The API is still pre-v1.
-
 ## What It Is
 
 `hirnok` is intentionally thin:
@@ -30,10 +28,10 @@ Requires Go 1.25+.
 | Package | Purpose |
 |---|---|
 | `pkg/nats` | NATS connection, core subscribe/publish, JetStream publish/consume. |
-| `pkg/queue` | Bounded generic FIFO queue. |
-| `pkg/worker` | Generic worker pool over a queue. |
 | `pkg/middleware` | Handler decorators: recover, retry, DLQ. |
 | `pkg/middleware/otel` | OpenTelemetry decorators and header carrier. |
+
+Queue and worker concurrency primitives are provided by [`github.com/rlsvr/inas`](https://github.com/rlsvr/inas).
 
 ## Core NATS
 
@@ -67,6 +65,9 @@ if err != nil {
 defer sub.Stop()
 
 _ = conn.Publish("orders.created", []byte(`{"id":"ord_1"}`))
+
+// Or publish JSON directly:
+_ = conn.PublishJSON("orders.created", Order{ID: "ord_1"})
 ```
 
 Use `PublishMsg` when you need headers or reply subjects:
@@ -84,6 +85,31 @@ if err := conn.PublishMsg(msg); err != nil {
 }
 ```
 
+### Channel Subscriptions
+
+When building streaming pipelines that consume messages via Go channels:
+
+```go
+sub, err := qpnats.SubscribeChan(ctx, conn, "market.ticks", 128)
+if err != nil {
+    panic(err)
+}
+defer sub.Stop()
+
+for msg := range sub.C() {
+    process(msg)
+}
+```
+
+Or stream typed JSON models directly, discarding poison payloads:
+
+```go
+sub, err := qpnats.SubscribeChanJSON[Tick](ctx, conn, "market.ticks", 128)
+for tick := range sub.C() {
+    processTick(tick)
+}
+```
+
 ## JetStream
 
 Create or fetch streams with `js.Raw()` when you need the underlying nats.go
@@ -95,6 +121,9 @@ if err != nil {
     panic(err)
 }
 
+// Access parent *qpnats.Conn at any time:
+rootConn := js.Conn()
+
 _, _ = js.Raw().CreateOrUpdateStream(ctx, jetstream.StreamConfig{
     Name:     "ORDERS",
     Subjects: []string{"orders.>"},
@@ -104,14 +133,15 @@ _, _ = js.Raw().CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 ### Pull Consumer
 
 `NewConsumer` creates or updates a pull consumer, starts delivery, and runs the
-handler through hirnok's queue and worker pool.
+handler through hirnok's queue and worker pool. Use `DefaultConsumerConfig` to
+start with standard defaults (explicit ack, deliver all, 30s ack wait) and override
+only what is specific to your consumer:
 
 ```go
-cons, err := js.NewConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
-    Durable:       "orders-worker",
-    FilterSubject: "orders.>",
-    AckWait:       30 * time.Second,
-}, func(ctx context.Context, m jetstream.Msg) error {
+cfg := qpnats.DefaultConsumerConfig("orders-worker")
+cfg.FilterSubject = "orders.>"
+
+cons, err := js.NewConsumer(ctx, "ORDERS", cfg, func(ctx context.Context, m jetstream.Msg) error {
     return processOrder(ctx, m.Data())
 })
 if err != nil {
@@ -153,6 +183,9 @@ if err != nil {
     return err
 }
 log.Printf("stored at stream sequence %d", ack.Sequence)
+
+// Or publish JSON directly:
+ack, err = js.PublishJSON(ctx, "orders.created", Order{ID: "ord_1"})
 ```
 
 Use `PublishMsg` when you need JetStream headers such as dedupe IDs:
@@ -177,6 +210,7 @@ JetStream handlers return errors to control the final ack action:
 | `nil` | `Ack()` | Message handled. |
 | `nats.ErrSkip` | `Ack()` | Drop intentionally without DLQ. |
 | `nats.ErrTerminate` | `Term()` | Permanent failure, no redelivery. |
+| `nats.NakWithDelay(err, d)` | `NakWithDelay(d)` | Redeliver after delay `d`. |
 | Any other error | `Nak()` | Redeliver according to consumer policy. |
 | Handler context expired | no ack action | Let server redeliver after `AckWait`. |
 
@@ -234,52 +268,83 @@ Lifecycle methods:
 
 ## Middleware
 
-Handlers are functions, so middleware is just function composition.
+Handlers are plain functions, so middleware is standard function wrapping. Use `Chain`
+to compose middleware pipelines cleanly without deeply nested function calls:
 
 ```go
-import qpmw "github.com/rlsvr/hirnok/pkg/middleware"
-
-h := qpmw.Recover(
-    qpmw.Retry(handle, 3, 100*time.Millisecond, 5*time.Second, nil),
+import (
+    qpmw "github.com/rlsvr/hirnok/pkg/middleware"
+    qpotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
 )
 
-sub, err := conn.Subscribe(ctx, "events.*", h)
+chain := qpmw.Chain(
+    func(h qpnats.JetHandler) qpnats.JetHandler { return qpmw.Recover(h) },
+    func(h qpnats.JetHandler) qpnats.JetHandler { return qpotel.TraceJet(h, tracer) },
+    func(h qpnats.JetHandler) qpnats.JetHandler {
+        return qpmw.DLQJet(h, js, "orders.dlq", nil,
+            qpmw.WithDLQHeaders(map[string]string{"service": "orders-worker"}),
+        )
+    },
+    func(h qpnats.JetHandler) qpnats.JetHandler {
+        shouldRetry := qpmw.WithNonRetryable(isSentinelError)
+        return qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, shouldRetry)
+    },
+)
+
+cons, err := js.NewConsumer(ctx, "ORDERS", cfg, chain(handleOrder))
 ```
 
-`Recover` catches panics and returns them as handler errors.
+### Panic Recovery & Retry
 
-`Retry` retries handler errors with exponential backoff. The default retry
-filter skips `context.Canceled`, `context.DeadlineExceeded`,
+`Recover` catches panics and converts them into errors with stack traces.
+
+`Retry` retries handler errors with exponential backoff and jitter (0 allocs/op fast path).
+The default retry filter `DefaultShouldRetry` skips `context.Canceled`, `context.DeadlineExceeded`,
 `nats.ErrSkip`, and `nats.ErrTerminate`.
 
-`DLQ` and `DLQJet` publish failed messages to a dead-letter subject with
-diagnostic headers:
+Extend the default retry predicate with custom non-retryable errors using `WithNonRetryable`:
 
 ```go
-h := qpmw.Recover(
-    qpmw.DLQJet(handleOrder, js, "orders.dlq", nil),
+filter := qpmw.WithNonRetryable(
+    func(err error) bool { return errors.Is(err, ErrInvalidInput) },
+    func(err error) bool { return errors.Is(err, ErrUnauthorized) },
 )
+retryMW := qpmw.Retry(handle, 3, 100*time.Millisecond, 2*time.Second, filter)
+```
 
-cons, err := js.NewConsumer(ctx, "ORDERS", cfg, h)
+### Dead Letter Queue (DLQ)
+
+`DLQ` and `DLQJet` publish failed messages to a dead-letter subject with
+diagnostic headers (`X-DLQ-Original-Subject`, `X-DLQ-Reason`, `X-DLQ-Time`).
+
+Customize headers using `WithDLQHeaders` or dynamic callbacks `WithDLQHeaderFunc`:
+
+```go
+h := qpmw.DLQJet(handleOrder, js, "orders.dlq", nil,
+    qpmw.WithDLQHeaders(map[string]string{
+        "topic_poisoned":   "orders.placed",
+        "handler_poisoned": "orders-worker",
+    }),
+)
 ```
 
 Default DLQ filtering sends normal errors to DLQ and skips context cancellation,
 deadline expiry, and `ErrSkip`. `ErrTerminate` is DLQ-worthy by default.
 
-For poison payloads, wrap `ErrTerminate` so the original message is not retried:
+### Typed JSON Handlers
+
+Instead of manually unmarshaling JSON and handling poison payloads in every handler,
+use `JSONHandler` (for Core NATS) or `JetJSONHandler` (for JetStream):
 
 ```go
-func handleOrder(ctx context.Context, m jetstream.Msg) error {
-    var event OrderEvent
-    if err := json.Unmarshal(m.Data(), &event); err != nil {
-        return fmt.Errorf("decode order event: %w", qpnats.ErrTerminate)
-    }
-    if err := event.Validate(); err != nil {
-        return fmt.Errorf("validate order event: %w", qpnats.ErrTerminate)
-    }
+h := qpnats.JetJSONHandler[OrderEvent](func(ctx context.Context, m jetstream.Msg, event OrderEvent) error {
     return processOrder(ctx, event)
-}
+})
 ```
+
+`JetJSONHandler` decodes `m.Data()` into `OrderEvent`. If `json.Unmarshal` fails, it
+returns an error joined with `qpnats.ErrTerminate`, causing JetStream to immediately
+`Term()` the poison message instead of repeatedly redelivering it.
 
 ## OpenTelemetry
 
@@ -302,11 +367,11 @@ cons, err := js.NewConsumer(ctx, "ORDERS", cfg, h)
 For publish-side tracing, inject into the native NATS headers:
 
 ```go
-msg := &natsio.Msg{Subject: "orders.created", Data: payload, Header: natsio.Header{}}
+msg := &natsio.Msg{Subject: "orders.created", Data: payload}
 ctx, span := tracer.Start(ctx, "nats.publish")
 defer span.End()
 
-otel.GetTextMapPropagator().Inject(ctx, qpotel.HeaderCarrier{Header: msg.Header})
+qpotel.Inject(ctx, msg)
 _, err := js.PublishMsg(ctx, msg)
 ```
 
@@ -317,6 +382,11 @@ different source, such as a custom pull batch loop, partitioned delivery, or an
 in-process test source, use the lower-level pieces directly.
 
 ```go
+import (
+    "github.com/rlsvr/inas/pkg/queue"
+    "github.com/rlsvr/inas/pkg/worker"
+)
+
 q := queue.New[jetstream.Msg](64)
 
 pool := worker.Run(ctx, 4, q, func(ctx context.Context, m jetstream.Msg) {

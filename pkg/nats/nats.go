@@ -1,6 +1,6 @@
 // Package nats is a thin, opinionated wrapper around github.com/nats-io/nats.go
 // that gives callers two things: connect, and register a handler. A bounded
-// hirnok/pkg/queue.Queue sits between the NATS receive callback and the
+// inas/pkg/queue.Queue sits between the NATS receive callback and the
 // handler so each subscription has a small, decoupled worker pool with
 // backpressure.
 //
@@ -26,8 +26,8 @@ import (
 
 	natsio "github.com/nats-io/nats.go"
 
-	"github.com/rlsvr/hirnok/pkg/queue"
-	"github.com/rlsvr/hirnok/pkg/worker"
+	"github.com/rlsvr/inas/pkg/queue"
+	"github.com/rlsvr/inas/pkg/worker"
 )
 
 const (
@@ -117,6 +117,7 @@ type Conn struct {
 	mu        sync.Mutex
 	subs      map[*Sub]struct{}
 	consumers map[*Consumer]struct{}
+	closedCh  chan struct{}
 }
 
 // Connect dials NATS and returns a ready Conn. Reconnect is enabled with
@@ -134,7 +135,28 @@ func Connect(cfg Config) (*Conn, error) {
 		opts = append(opts, natsio.Name(cfg.Name))
 	}
 	opts = append(opts, cfg.NATSOptions...)
-	nc, err := natsio.Connect(cfg.URL, opts...)
+
+	natsOpts := natsio.GetDefaultOptions()
+	natsOpts.Url = cfg.URL
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt(&natsOpts); err != nil {
+				return nil, fmt.Errorf("nats option: %w", err)
+			}
+		}
+	}
+
+	closedCh := make(chan struct{})
+	var closeOnce sync.Once
+	userClosedCB := natsOpts.ClosedCB
+	natsOpts.ClosedCB = func(conn *natsio.Conn) {
+		closeOnce.Do(func() { close(closedCh) })
+		if userClosedCB != nil {
+			userClosedCB(conn)
+		}
+	}
+
+	nc, err := natsOpts.Connect()
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
 	}
@@ -143,6 +165,7 @@ func Connect(cfg Config) (*Conn, error) {
 		cfg:       cfg,
 		subs:      make(map[*Sub]struct{}),
 		consumers: make(map[*Consumer]struct{}),
+		closedCh:  closedCh,
 	}, nil
 }
 
@@ -166,34 +189,56 @@ func (c *Conn) Close() {
 // Shutdown drains registered subscriptions/consumers, waits for their workers,
 // then drains and closes the underlying NATS connection.
 func (c *Conn) Shutdown(ctx context.Context) error {
-	var errs []error
-	for _, sub := range c.subscriptions() {
-		if err := sub.Drain(ctx); err != nil {
+	subs := c.subscriptions()
+	consumers := c.consumerList()
+
+	var (
+		errMu sync.Mutex
+		errs  []error
+		wg    sync.WaitGroup
+	)
+
+	addErr := func(err error) {
+		if err != nil {
+			errMu.Lock()
 			errs = append(errs, err)
+			errMu.Unlock()
 		}
 	}
-	for _, cons := range c.consumerList() {
-		if err := cons.Drain(ctx); err != nil {
-			errs = append(errs, err)
-		}
+
+	for _, sub := range subs {
+		wg.Add(1)
+		go func(s *Sub) {
+			defer wg.Done()
+			addErr(s.Drain(ctx))
+		}(sub)
 	}
+
+	for _, cons := range consumers {
+		wg.Add(1)
+		go func(cons *Consumer) {
+			defer wg.Done()
+			addErr(cons.Drain(ctx))
+		}(cons)
+	}
+
+	wg.Wait()
+
 	if c.nc == nil || c.nc.IsClosed() {
 		return errors.Join(errs...)
 	}
+
 	if err := c.nc.Drain(); err != nil && !errors.Is(err, natsio.ErrConnectionClosed) {
-		errs = append(errs, err)
+		addErr(err)
 	}
-	t := time.NewTicker(10 * time.Millisecond)
-	defer t.Stop()
-	for !c.nc.IsClosed() {
-		select {
-		case <-ctx.Done():
-			c.nc.Close()
-			errs = append(errs, ctx.Err())
-			return errors.Join(errs...)
-		case <-t.C:
-		}
+
+	select {
+	case <-ctx.Done():
+		c.nc.Close()
+		addErr(ctx.Err())
+	case <-c.closedCh:
 	}
+
 	return errors.Join(errs...)
 }
 
@@ -321,7 +366,7 @@ func (c *Conn) startSub(ctx context.Context, subject, group string, h Handler, o
 // running until they observe ctx cancellation — call Wait to block until
 // they have actually exited.
 func (s *Sub) Stop() error {
-	return s.stop(false, context.Background())
+	return s.closeWithDrain(context.Background(), false)
 }
 
 // Unsubscribe is an alias for Stop.
@@ -332,10 +377,10 @@ func (s *Sub) Unsubscribe() error {
 // Drain stops accepting new messages, closes the queue to new pushes, and
 // waits for already queued/in-flight handler calls to finish.
 func (s *Sub) Drain(ctx context.Context) error {
-	return s.stop(true, ctx)
+	return s.closeWithDrain(ctx, true)
 }
 
-func (s *Sub) stop(drain bool, ctx context.Context) error {
+func (s *Sub) closeWithDrain(ctx context.Context, drain bool) error {
 	s.mu.Lock()
 	if s.closed {
 		err := s.err

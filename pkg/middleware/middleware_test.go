@@ -28,6 +28,16 @@ func TestRecoverCatchesPanic(t *testing.T) {
 	if !strings.Contains(err.Error(), "panic in handler") || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("err = %q, want panic in handler + boom", err)
 	}
+	var pe *PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *PanicError, got %T", err)
+	}
+	if len(pe.Stack) == 0 {
+		t.Fatal("expected non-empty stack trace in PanicError")
+	}
+	if !strings.Contains(string(pe.Stack), "middleware_test.go") {
+		t.Fatalf("stack trace does not contain middleware_test.go:\n%s", pe.Stack)
+	}
 }
 
 func TestRecoverCatchesNonStringPanic(t *testing.T) {
@@ -259,6 +269,70 @@ func TestRetryAroundRecover(t *testing.T) {
 	}
 }
 
+func TestChainExecutionOrder(t *testing.T) {
+	var order []string
+	m1 := func(next func(context.Context, int) error) func(context.Context, int) error {
+		return func(ctx context.Context, v int) error {
+			order = append(order, "m1_before")
+			err := next(ctx, v)
+			order = append(order, "m1_after")
+			return err
+		}
+	}
+	m2 := func(next func(context.Context, int) error) func(context.Context, int) error {
+		return func(ctx context.Context, v int) error {
+			order = append(order, "m2_before")
+			err := next(ctx, v)
+			order = append(order, "m2_after")
+			return err
+		}
+	}
+	handler := func(_ context.Context, _ int) error {
+		order = append(order, "handler")
+		return nil
+	}
+
+	chained := Chain(m1, m2)(handler)
+	if err := chained(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	want := []string{"m1_before", "m2_before", "handler", "m2_after", "m1_after"}
+	if len(order) != len(want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order[%d] = %q, want %q", i, order[i], want[i])
+		}
+	}
+}
+
+func TestWithNonRetryable(t *testing.T) {
+	customErr := errors.New("custom non-retryable")
+	predicate := WithNonRetryable(func(err error) bool {
+		return errors.Is(err, customErr)
+	})
+
+	// Custom error should be non-retryable
+	if predicate(customErr) {
+		t.Fatal("expected customErr to be non-retryable")
+	}
+
+	// Default non-retryable errors should still be non-retryable
+	if predicate(context.Canceled) {
+		t.Fatal("expected context.Canceled to be non-retryable")
+	}
+	if predicate(qpnats.ErrTerminate) {
+		t.Fatal("expected ErrTerminate to be non-retryable")
+	}
+
+	// Normal error should still be retryable
+	if !predicate(errors.New("transient fault")) {
+		t.Fatal("expected transient fault to be retryable")
+	}
+}
+
 // ---------------- Integration with pkg/nats types ----------------
 
 func TestRecoverAssignableToNatsHandler(t *testing.T) {
@@ -290,5 +364,35 @@ func TestRetryAssignableToJetHandler(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestRetrySkipsNakDelayError(t *testing.T) {
+	var calls atomic.Int32
+	h := Retry(func(_ context.Context, _ int) error {
+		calls.Add(1)
+		return qpnats.NakWithDelay(errors.New("db busy"), 5*time.Second)
+	}, 5, time.Millisecond, 0, nil)
+
+	err := h(context.Background(), 0)
+	var nd *qpnats.NakDelayError
+	if !errors.As(err, &nd) {
+		t.Fatalf("err = %v, want NakDelayError", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls = %d, want 1 (NakDelayError should not be retried locally)", got)
+	}
+}
+
+func BenchmarkRetryHappyPath(b *testing.B) {
+	h := Retry(func(_ context.Context, _ int) error {
+		return nil
+	}, 3, time.Millisecond, time.Second, nil)
+
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = h(ctx, i)
 	}
 }

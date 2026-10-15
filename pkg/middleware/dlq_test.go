@@ -64,6 +64,8 @@ func captureDLQ(t *testing.T, c *qpnats.Conn, subject string) <-chan *natsio.Msg
 
 // ---------------- DLQ (core NATS) ----------------
 
+const testOrigSubject = "orig.x"
+
 func TestDLQPublishesOnError(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL())
@@ -73,7 +75,7 @@ func TestDLQPublishesOnError(t *testing.T) {
 		return errors.New("boom")
 	}, c, "dlq.go", nil)
 
-	m := &natsio.Msg{Subject: "orig.x", Data: []byte("payload"), Header: natsio.Header{}}
+	m := &natsio.Msg{Subject: testOrigSubject, Data: []byte("payload"), Header: natsio.Header{}}
 	if err := h(context.Background(), m); err != nil {
 		t.Fatalf("wrapper err = %v, want nil after DLQ", err)
 	}
@@ -97,7 +99,7 @@ func TestDLQAddsHeaders(t *testing.T) {
 		return errors.New("bad")
 	}, c, "dlq.hdr", nil)
 
-	m := &natsio.Msg{Subject: "orig.x", Data: []byte("p"), Header: natsio.Header{}}
+	m := &natsio.Msg{Subject: testOrigSubject, Data: []byte("p"), Header: natsio.Header{}}
 	_ = h(context.Background(), m)
 
 	select {
@@ -105,8 +107,8 @@ func TestDLQAddsHeaders(t *testing.T) {
 		if v := dm.Header.Get(HeaderDLQReason); v != "bad" {
 			t.Errorf("%s = %q, want bad", HeaderDLQReason, v)
 		}
-		if v := dm.Header.Get(HeaderDLQSubject); v != "orig.x" {
-			t.Errorf("%s = %q, want orig.x", HeaderDLQSubject, v)
+		if v := dm.Header.Get(HeaderDLQSubject); v != testOrigSubject {
+			t.Errorf("%s = %q, want %s", HeaderDLQSubject, v, testOrigSubject)
 		}
 		if v := dm.Header.Get(HeaderDLQAt); v == "" {
 			t.Errorf("%s is empty", HeaderDLQAt)
@@ -241,6 +243,28 @@ func TestDLQDefaultSkipsCtxDeadline(t *testing.T) {
 	}
 }
 
+func TestDLQDefaultSkipsNakDelay(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+	dlq := captureDLQ(t, c, "dlq.nakdelay")
+
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return qpnats.NakWithDelay(errors.New("db busy"), 5*time.Second)
+	}, c, "dlq.nakdelay", nil)
+
+	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
+	err := h(context.Background(), m)
+	var nd *qpnats.NakDelayError
+	if !errors.As(err, &nd) {
+		t.Fatalf("err = %v, want NakDelayError", err)
+	}
+	select {
+	case dm := <-dlq:
+		t.Fatalf("NakDelayError should not DLQ; got: %v", dm)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestDLQErrTerminateIsDLQd(t *testing.T) {
 	s := runServer(t)
 	c := mustConnect(t, s.ClientURL())
@@ -290,7 +314,7 @@ func TestDLQPublishFailureStripsErrTerminate(t *testing.T) {
 	err := dlqPublishError(
 		fmt.Errorf("bad payload: %w", qpnats.ErrTerminate),
 		"dlq.term",
-		errors.New("publish failed"),
+		errors.New("publish connection closed"),
 	)
 	if errors.Is(err, qpnats.ErrTerminate) {
 		t.Fatalf("publish failure error should not preserve ErrTerminate: %v", err)
@@ -468,6 +492,70 @@ func TestErrTerminateBypassesRetry(t *testing.T) {
 	}
 	select {
 	case <-dlq:
+	case <-time.After(time.Second):
+		t.Fatal("no DLQ message")
+	}
+}
+
+func TestDLQCustomHeaders(t *testing.T) {
+	const signupSubject = "events.user.signup"
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+	dlq := captureDLQ(t, c, "dlq.custom")
+
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return errors.New("boom")
+	}, c, "dlq.custom", nil,
+		WithDLQHeaders(map[string]string{
+			"topic_poisoned":   signupSubject,
+			"handler_poisoned": "user-signup-handler",
+		}),
+	)
+
+	m := &natsio.Msg{Subject: signupSubject, Data: []byte("payload"), Header: natsio.Header{}}
+	if err := h(context.Background(), m); err != nil {
+		t.Fatalf("wrapper err = %v, want nil", err)
+	}
+
+	select {
+	case dm := <-dlq:
+		if dm.Header.Get("topic_poisoned") != signupSubject {
+			t.Errorf("topic_poisoned = %q", dm.Header.Get("topic_poisoned"))
+		}
+		if dm.Header.Get("handler_poisoned") != "user-signup-handler" {
+			t.Errorf("handler_poisoned = %q", dm.Header.Get("handler_poisoned"))
+		}
+		if dm.Header.Get(HeaderDLQReason) != "boom" {
+			t.Errorf("HeaderDLQReason = %q", dm.Header.Get(HeaderDLQReason))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no DLQ message")
+	}
+}
+
+func TestDLQCustomHeaderFunc(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+	dlq := captureDLQ(t, c, "dlq.func")
+
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return errors.New("custom test fault")
+	}, c, "dlq.func", nil,
+		WithDLQHeaderFunc(func(h natsio.Header, _ error, origSubject string) {
+			h.Set("custom_dynamic", "dyn_"+origSubject)
+		}),
+	)
+
+	m := &natsio.Msg{Subject: "orders.placed", Data: []byte("d"), Header: natsio.Header{}}
+	if err := h(context.Background(), m); err != nil {
+		t.Fatalf("wrapper err = %v, want nil", err)
+	}
+
+	select {
+	case dm := <-dlq:
+		if dm.Header.Get("custom_dynamic") != "dyn_orders.placed" {
+			t.Errorf("custom_dynamic = %q", dm.Header.Get("custom_dynamic"))
+		}
 	case <-time.After(time.Second):
 		t.Fatal("no DLQ message")
 	}

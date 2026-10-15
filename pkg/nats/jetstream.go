@@ -10,8 +10,8 @@ import (
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/rlsvr/hirnok/pkg/queue"
-	"github.com/rlsvr/hirnok/pkg/worker"
+	"github.com/rlsvr/inas/pkg/queue"
+	"github.com/rlsvr/inas/pkg/worker"
 )
 
 const defaultAckWait = 30 * time.Second
@@ -34,9 +34,24 @@ func (c *Conn) JetStream() (*JetStream, error) {
 	return &JetStream{conn: c, js: js, cfg: c.cfg}, nil
 }
 
+// Conn returns the underlying *Conn that owns this JetStream context.
+func (j *JetStream) Conn() *Conn { return j.conn }
+
 // Raw returns the underlying jetstream.JetStream for advanced use
 // (stream / KV / object store management not yet exposed here).
 func (j *JetStream) Raw() jetstream.JetStream { return j.js }
+
+// DefaultConsumerConfig returns a consumer configuration initialized with sensible
+// production defaults: explicit ack policy, deliver all policy, and 30-second ack wait.
+// Callers can adjust or override fields (such as FilterSubject, MaxDeliver, etc.) as needed.
+func DefaultConsumerConfig(durable string) jetstream.ConsumerConfig {
+	return jetstream.ConsumerConfig{
+		Durable:       durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckWait:       defaultAckWait,
+	}
+}
 
 // JetHandler is the JetStream handler signature. The wrapper auto-acks on
 // nil and naks on non-nil error. If ctx is already Done when the handler
@@ -47,11 +62,16 @@ func (j *JetStream) Raw() jetstream.JetStream { return j.js }
 // and pipelines so work stops cleanly when the ack window closes.
 type JetHandler func(ctx context.Context, m jetstream.Msg) error
 
+type queuedJetMsg struct {
+	msg      jetstream.Msg
+	deadline time.Time
+}
+
 // Consumer is a running JS consumer with a worker pool.
 type Consumer struct {
 	conn   *Conn
 	cc     jetstream.ConsumeContext
-	q      *queue.Queue[jetstream.Msg]
+	q      *queue.Queue[queuedJetMsg]
 	cancel context.CancelFunc
 	pool   *worker.Pool
 	mu     sync.Mutex
@@ -88,8 +108,9 @@ func (j *JetStream) NewConsumer(
 		return nil, fmt.Errorf("upsert consumer: %w", err)
 	}
 
+	run := j.cfg.runOptions(opts)
 	return j.startConsumer(ctx, cfg, h, func(cb func(jetstream.Msg)) (jetstream.ConsumeContext, error) {
-		return cons.Consume(cb)
+		return cons.Consume(cb, jetstream.PullMaxMessages(run.queueSize+run.workers))
 	}, opts...)
 }
 
@@ -165,11 +186,14 @@ func (j *JetStream) startConsumer(
 	}
 	run := j.cfg.runOptions(opts)
 	consCtx, cancel := context.WithCancel(ctx)
-	q := queue.New[jetstream.Msg](run.queueSize)
+	q := queue.New[queuedJetMsg](run.queueSize)
 	handlerTimeout := perMessageTimeout(cfg.AckWait, run.ackBuffer)
 
 	cc, err := start(func(raw jetstream.Msg) {
-		_ = q.Push(consCtx, raw)
+		_ = q.Push(consCtx, queuedJetMsg{
+			msg:      raw,
+			deadline: time.Now().Add(handlerTimeout),
+		})
 	})
 	if err != nil {
 		cancel()
@@ -177,8 +201,11 @@ func (j *JetStream) startConsumer(
 		return nil, fmt.Errorf("start consume: %w", err)
 	}
 
-	pool := worker.Run(consCtx, run.workers, q, func(parent context.Context, m jetstream.Msg) {
-		DispatchJet(parent, h, m, handlerTimeout)
+	pool := worker.Run(consCtx, run.workers, q, func(parent context.Context, item queuedJetMsg) {
+		if time.Now().After(item.deadline) {
+			return
+		}
+		DispatchJetWithDeadline(parent, h, item.msg, item.deadline)
 	})
 
 	consumer := &Consumer{
@@ -202,6 +229,7 @@ func (j *JetStream) startConsumer(
 //   - handler returns nil -> Ack
 //   - handler returns ErrSkip -> Ack (explicit silent drop)
 //   - handler returns ErrTerminate -> Term (explicit permanent failure)
+//   - handler returns NakDelayError -> NakWithDelay (server will redeliver after delay)
 //   - handler returns any other error -> Nak (server will redeliver)
 //   - per-message ctx expired before handler returns -> no action (server
 //     has already redelivered or will after AckWait)
@@ -212,9 +240,16 @@ func (j *JetStream) startConsumer(
 // from their own worker pool and get the same ack semantics. See the "Custom
 // subscribers" section in the README for the wiring recipe.
 func DispatchJet(parent context.Context, h JetHandler, m jetstream.Msg, timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	DispatchJetWithDeadline(parent, h, m, time.Now().Add(timeout))
+}
+
+// DispatchJetWithDeadline runs h on m with a context having the specified deadline,
+// syncing the handler context directly with the server AckWait countdown.
+func DispatchJetWithDeadline(parent context.Context, h JetHandler, m jetstream.Msg, deadline time.Time) {
+	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
 	err := h(ctx, m)
+	var nd *NakDelayError
 	switch {
 	case ctx.Err() != nil:
 		// AckWait elapsed mid-handler (or parent canceled). Server has
@@ -228,6 +263,12 @@ func DispatchJet(parent context.Context, h JetHandler, m jetstream.Msg, timeout 
 		// Explicit permanent failure signal from the handler. Pair with DLQ
 		// middleware to capture the payload before it is terminated.
 		_ = m.Term()
+	case errors.As(err, &nd):
+		if nd.Delay > 0 {
+			_ = m.NakWithDelay(nd.Delay)
+		} else {
+			_ = m.Nak()
+		}
 	default:
 		_ = m.Nak()
 	}
@@ -237,16 +278,16 @@ func DispatchJet(parent context.Context, h JetHandler, m jetstream.Msg, timeout 
 // still be running until they observe ctx cancellation - call Wait to block
 // until they have actually exited.
 func (c *Consumer) Stop() {
-	_ = c.stop(false, context.Background())
+	_ = c.closeWithDrain(context.Background(), false)
 }
 
 // Drain stops delivery, lets queued/in-flight handlers finish, and waits for
 // worker shutdown.
 func (c *Consumer) Drain(ctx context.Context) error {
-	return c.stop(true, ctx)
+	return c.closeWithDrain(ctx, true)
 }
 
-func (c *Consumer) stop(drain bool, ctx context.Context) error {
+func (c *Consumer) closeWithDrain(ctx context.Context, drain bool) error {
 	c.mu.Lock()
 	if c.closed {
 		err := c.err
@@ -281,6 +322,7 @@ func (c *Consumer) stop(drain bool, ctx context.Context) error {
 		c.cancel()
 		c.q.Close()
 	}
+	c.drainRemaining()
 	if c.conn != nil {
 		c.conn.unregisterConsumer(c)
 	}
@@ -288,6 +330,17 @@ func (c *Consumer) stop(drain bool, ctx context.Context) error {
 	c.err = err
 	c.mu.Unlock()
 	return err
+}
+
+func (c *Consumer) drainRemaining() {
+	for {
+		select {
+		case item := <-c.q.Recv():
+			_ = item.msg.Nak()
+		default:
+			return
+		}
+	}
 }
 
 // Wait blocks until all worker goroutines have exited or ctx is canceled.

@@ -88,6 +88,28 @@ func TraceJet(h qpnats.JetHandler, tracer trace.Tracer) qpnats.JetHandler {
 	}
 }
 
+// Inject injects OpenTelemetry propagation context from ctx into msg's Header.
+// If msg is nil, it does nothing. If msg.Header is nil, it is initialized to an
+// empty natsio.Header before injection.
+func Inject(ctx context.Context, msg *natsio.Msg) {
+	if msg == nil {
+		return
+	}
+	if msg.Header == nil {
+		msg.Header = make(natsio.Header)
+	}
+	otelapi.GetTextMapPropagator().Inject(ctx, HeaderCarrier{Header: msg.Header})
+}
+
+// Extract extracts OpenTelemetry propagation context from msg's Header into ctx.
+// If msg is nil or msg.Header is nil, ctx is returned unchanged.
+func Extract(ctx context.Context, msg *natsio.Msg) context.Context {
+	if msg == nil || msg.Header == nil {
+		return ctx
+	}
+	return otelapi.GetTextMapPropagator().Extract(ctx, HeaderCarrier{Header: msg.Header})
+}
+
 // HeaderCarrier adapts a nats.Header to OpenTelemetry's TextMapCarrier
 // so callers can propagation.Inject / Extract on it. Useful for the
 // publish-side tracing snippet documented in the README.
@@ -105,9 +127,11 @@ func (c HeaderCarrier) Get(key string) string {
 	return c.Header.Get(key)
 }
 
-// Set sets key=value. Panics if the underlying header is nil.
+// Set sets key=value. If the underlying Header map is nil, this is a no-op.
 func (c HeaderCarrier) Set(key, value string) {
-	c.Header.Set(key, value)
+	if c.Header != nil {
+		c.Header.Set(key, value)
+	}
 }
 
 // Keys returns the header field names.

@@ -703,11 +703,13 @@ func assertSentinelHandled(t *testing.T, returnErr func() error, stream, subject
 // JS consumer.
 type dispatchStub struct {
 	jetstream.Msg
-	mu       sync.Mutex
-	acked    int
-	naked    int
-	termed   int
-	ackDelay time.Duration // optional sleep inside Ack (for ctx-expiry test)
+	mu         sync.Mutex
+	acked      int
+	naked      int
+	termed     int
+	nakDelayed int
+	lastDelay  time.Duration
+	ackDelay   time.Duration // optional sleep inside Ack (for ctx-expiry test)
 }
 
 func (s *dispatchStub) Ack() error {
@@ -727,6 +729,14 @@ func (s *dispatchStub) Nak() error {
 	return nil
 }
 
+func (s *dispatchStub) NakWithDelay(delay time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nakDelayed++
+	s.lastDelay = delay
+	return nil
+}
+
 func (s *dispatchStub) Term() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -738,6 +748,12 @@ func (s *dispatchStub) snapshot() (int, int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.acked, s.naked, s.termed
+}
+
+func (s *dispatchStub) snapshotNakDelay() (int, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nakDelayed, s.lastDelay
 }
 
 func TestDispatchJetDirect(t *testing.T) {
@@ -797,6 +813,32 @@ func TestDispatchJetDirect(t *testing.T) {
 			t.Fatalf("acks=%d naks=%d terms=%d, want 0 0 0 (ctx expiry -> no ack action)", a, n, term)
 		}
 	})
+
+	t.Run("nak_with_delay", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ jetstream.Msg) error {
+			return NakWithDelay(errors.New("db busy"), 5*time.Second)
+		}
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		nd, delay := stub.snapshotNakDelay()
+		if a != 0 || n != 0 || term != 0 || nd != 1 || delay != 5*time.Second {
+			t.Fatalf("acks=%d naks=%d terms=%d nakDelayed=%d delay=%v, want 0 0 0 1 5s", a, n, term, nd, delay)
+		}
+	})
+
+	t.Run("nak_with_zero_delay_falls_back_to_nak", func(t *testing.T) {
+		stub := &dispatchStub{}
+		h := func(_ context.Context, _ jetstream.Msg) error {
+			return NakWithDelay(errors.New("try now"), 0)
+		}
+		DispatchJet(context.Background(), h, stub, time.Second)
+		a, n, term := stub.snapshot()
+		nd, _ := stub.snapshotNakDelay()
+		if a != 0 || n != 1 || term != 0 || nd != 0 {
+			t.Fatalf("acks=%d naks=%d terms=%d nakDelayed=%d, want 0 1 0 0", a, n, term, nd)
+		}
+	})
 }
 
 func TestPerMessageTimeoutDefaults(t *testing.T) {
@@ -813,5 +855,128 @@ func TestPerMessageTimeoutDefaults(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("perMessageTimeout(%v,%v) = %v, want %v", tc.ackWait, tc.buffer, got, tc.want)
 		}
+	}
+}
+
+func TestConsumerStopNaksQueuedMessages(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1, QueueSize: 10})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_STOP_NAK", "stop_nak.>")
+
+	for i := range 5 {
+		if _, err := j.Publish(context.Background(), "stop_nak.x", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	blockHandler := make(chan struct{})
+	var processed atomic.Int32
+
+	cons, err := j.NewConsumer(context.Background(), "S_STOP_NAK", jetstream.ConsumerConfig{
+		Durable:       "c_stop_nak",
+		FilterSubject: "stop_nak.>",
+		AckWait:       10 * time.Second,
+	}, func(ctx context.Context, _ jetstream.Msg) error {
+		if processed.Add(1) == 1 {
+			select {
+			case <-blockHandler:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	}, WithQueueSize(10), WithWorkers(1))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return processed.Load() == 1 })
+	time.Sleep(50 * time.Millisecond)
+
+	cons.Stop()
+	close(blockHandler)
+
+	var secondSeen atomic.Int32
+	cons2, err := j.NewConsumer(context.Background(), "S_STOP_NAK", jetstream.ConsumerConfig{
+		Durable:       "c_stop_nak",
+		FilterSubject: "stop_nak.>",
+		AckWait:       10 * time.Second,
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		secondSeen.Add(1)
+		return nil
+	}, WithWorkers(2))
+	if err != nil {
+		t.Fatalf("new consumer 2: %v", err)
+	}
+	defer cons2.Stop()
+
+	waitFor(t, 3*time.Second, func() bool { return secondSeen.Load() >= 4 })
+}
+
+func TestConsumerSkipsExpiredQueuedMessages(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1, QueueSize: 10})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_EXPIRED", "expired.>")
+
+	for i := range 2 {
+		if _, err := j.Publish(context.Background(), "expired.x", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	var processed atomic.Int32
+	// Very short AckWait so that while message 1 is processed, message 2 expires in the queue.
+	cons, err := j.NewConsumer(context.Background(), "S_EXPIRED", jetstream.ConsumerConfig{
+		Durable:       "c_expired",
+		FilterSubject: "expired.>",
+		AckWait:       40 * time.Millisecond,
+		MaxDeliver:    1,
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		n := processed.Add(1)
+		if n == 1 {
+			// Sleep longer than AckWait so message 2 expires in queue
+			time.Sleep(60 * time.Millisecond)
+		}
+		return nil
+	}, WithWorkers(1), WithQueueSize(10))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	// Wait a moment for worker to pop
+	time.Sleep(150 * time.Millisecond)
+
+	// Since message 2 expired while queued, the worker pool must have skipped it!
+	// So processed should remain 1 (message 2 skipped because deadline elapsed).
+	if got := processed.Load(); got != 1 {
+		t.Fatalf("processed = %d, want 1 (expired queued message should be skipped)", got)
+	}
+}
+
+func TestJetStreamConn(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{})
+	j := mustJetStream(t, c)
+
+	if j.Conn() != c {
+		t.Fatalf("expected j.Conn() to return parent *Conn %p, got %p", c, j.Conn())
+	}
+}
+
+func TestDefaultConsumerConfig(t *testing.T) {
+	cfg := DefaultConsumerConfig("my-durable")
+	if cfg.Durable != "my-durable" {
+		t.Errorf("expected Durable 'my-durable', got %q", cfg.Durable)
+	}
+	if cfg.AckPolicy != jetstream.AckExplicitPolicy {
+		t.Errorf("expected AckExplicitPolicy, got %v", cfg.AckPolicy)
+	}
+	if cfg.DeliverPolicy != jetstream.DeliverAllPolicy {
+		t.Errorf("expected DeliverAllPolicy, got %v", cfg.DeliverPolicy)
+	}
+	if cfg.AckWait != 30*time.Second {
+		t.Errorf("expected AckWait 30s, got %v", cfg.AckWait)
 	}
 }

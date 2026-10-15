@@ -1,0 +1,25 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts & coverage
+*.test
+*.out
+coverage.html
+profile.pprof
+
+# OS & IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs and scratch files
+*.log
+*.png
+.playwright-mcp/
