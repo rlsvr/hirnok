@@ -560,3 +560,96 @@ func TestDLQCustomHeaderFunc(t *testing.T) {
 		t.Fatal("no DLQ message")
 	}
 }
+
+func TestDLQ_ReasonTruncationAndSanitation(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+	dlq := captureDLQ(t, c, "dlq.sanitize")
+
+	// Multiline error (e.g. panic stack trace)
+	multilineErr := errors.New("first line of issue\nsecond line stack trace\nthird line")
+	h1 := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return multilineErr
+	}, c, "dlq.sanitize", nil)
+
+	m1 := &natsio.Msg{Subject: "test.multiline", Data: []byte("d1")}
+	if err := h1(context.Background(), m1); err != nil {
+		t.Fatalf("h1 err = %v, want nil", err)
+	}
+
+	select {
+	case dm := <-dlq:
+		reason := dm.Header.Get(HeaderDLQReason)
+		if strings.Contains(reason, "\n") || strings.Contains(reason, "\r") {
+			t.Errorf("expected newlines to be stripped from reason, got: %q", reason)
+		}
+		if reason != "first line of issue" {
+			t.Errorf("reason = %q, want %q", reason, "first line of issue")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no DLQ message for multiline")
+	}
+
+	// Long error exceeding 1024 bytes
+	longErr := errors.New(strings.Repeat("x", 2000))
+	h2 := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return longErr
+	}, c, "dlq.sanitize", nil)
+
+	m2 := &natsio.Msg{Subject: "test.long", Data: []byte("d2")}
+	if err := h2(context.Background(), m2); err != nil {
+		t.Fatalf("h2 err = %v, want nil", err)
+	}
+
+	select {
+	case dm := <-dlq:
+		reason := dm.Header.Get(HeaderDLQReason)
+		if len(reason) > maxDLQReasonLen+len("...(truncated)") {
+			t.Errorf("reason length = %d, expected <= %d", len(reason), maxDLQReasonLen+len("...(truncated)"))
+		}
+		if !strings.HasSuffix(reason, "...(truncated)") {
+			t.Errorf("expected reason to end with '...(truncated)', got: %q", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no DLQ message for long error")
+	}
+}
+
+func TestDLQ_NilHandlerPanics(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler in DLQ")
+		}
+	}()
+
+	_ = DLQ(nil, c, "dlq.nil", nil)
+}
+
+func TestDLQ_ContextCanceledDoesNotPublish(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL())
+	dlq := captureDLQ(t, c, "dlq.canceled")
+
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
+		return errors.New("some fault")
+	}, c, "dlq.canceled", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	m := &natsio.Msg{Subject: "test.canceled", Data: []byte("d")}
+	err := h(ctx, m)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got: %v", err)
+	}
+
+	select {
+	case <-dlq:
+		t.Fatal("unexpected message published to DLQ when context was canceled")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: nothing published
+	}
+}

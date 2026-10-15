@@ -321,7 +321,7 @@ retryMW := middleware.Retry(handle, 3, 100*time.Millisecond, 2*time.Second, filt
 ### Dead Letter Queue (DLQ)
 
 `DLQ` and `DLQJet` publish failed messages to a dead-letter subject with
-diagnostic headers (`X-DLQ-Original-Subject`, `X-DLQ-Reason`, `X-DLQ-Time`).
+diagnostic headers (`Hirnok-DLQ-Subject`, `Hirnok-DLQ-Reason`, `Hirnok-DLQ-At`).
 
 Customize headers using `WithDLQHeaders` or dynamic callbacks `WithDLQHeaderFunc`:
 

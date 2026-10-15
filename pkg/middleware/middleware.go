@@ -3,10 +3,13 @@
 // hirnok's nats.Handler and nats.JetHandler, but generic over any
 // message type M.
 //
-// The package intentionally does NOT define a Middleware type or a
-// Chain helper. Composition is plain function calls:
+// The package defines a generic Middleware type and Chain helper for composing
+// pipelines cleanly:
 //
-//	h := middleware.Recover(middleware.Retry(myHandler, 3, ...))
+//	h := middleware.Chain(
+//		func(h hirnok.Handler) hirnok.Handler { return middleware.Recover(h) },
+//		func(h hirnok.Handler) hirnok.Handler { return middleware.Retry(h, 3, ...) },
+//	)(myHandler)
 //	conn.Subscribe(ctx, "foo", h)
 //
 // Recover and Retry are fully generic. OpenTelemetry tracing helpers live in
@@ -48,6 +51,9 @@ func (p *PanicError) Unwrap() error {
 // crashing the worker goroutine. The panic value and stack trace are
 // captured and returned as a *PanicError.
 func Recover[M any](h func(context.Context, M) error) func(context.Context, M) error {
+	if h == nil {
+		panic("middleware: Recover requires a non-nil handler")
+	}
 	return func(ctx context.Context, m M) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -100,6 +106,9 @@ func Retry[M any](
 	initialBackoff, maxBackoff time.Duration,
 	shouldRetry func(error) bool,
 ) func(context.Context, M) error {
+	if h == nil {
+		panic("middleware: Retry requires a non-nil handler")
+	}
 	if attempts <= 0 {
 		panic("middleware: Retry attempts must be > 0")
 	}
@@ -120,17 +129,28 @@ func Retry[M any](
 		if maxBackoff > 0 {
 			b = retry.WithCappedDuration(maxBackoff, b)
 		}
+		b = retry.WithJitterPercent(10, b)
 		b = retry.WithMaxRetries(uint64(attempts-1), b) //nolint:gosec // attempts > 0 validated above
+
+		var t *time.Timer
+		defer func() {
+			if t != nil {
+				t.Stop()
+			}
+		}()
 
 		for {
 			next, stop := b.Next()
 			if stop {
 				return err
 			}
-			t := time.NewTimer(next)
+			if t == nil {
+				t = time.NewTimer(next)
+			} else {
+				t.Reset(next)
+			}
 			select {
 			case <-ctx.Done():
-				t.Stop()
 				return ctx.Err()
 			case <-t.C:
 			}

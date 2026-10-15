@@ -69,14 +69,16 @@ type queuedJetMsg struct {
 
 // Consumer is a running JS consumer with a worker pool.
 type Consumer struct {
-	conn   *Conn
-	cc     jetstream.ConsumeContext
-	q      *queue.Queue[queuedJetMsg]
-	cancel context.CancelFunc
-	pool   *worker.Pool
-	mu     sync.Mutex
-	closed bool
-	err    error
+	conn         *Conn
+	cc           jetstream.ConsumeContext
+	q            *queue.Queue[queuedJetMsg]
+	cancel       context.CancelFunc
+	pool         *worker.Pool
+	mu           sync.Mutex
+	closing      bool
+	closeDone    chan struct{}
+	err          error
+	errorHandler func(error)
 }
 
 type startJetConsumer func(func(jetstream.Msg)) (jetstream.ConsumeContext, error)
@@ -190,9 +192,10 @@ func (j *JetStream) startConsumer(
 	handlerTimeout := perMessageTimeout(cfg.AckWait, run.ackBuffer)
 
 	cc, err := start(func(raw jetstream.Msg) {
+		dl := time.Now().Add(handlerTimeout)
 		_ = q.Push(consCtx, queuedJetMsg{
 			msg:      raw,
-			deadline: time.Now().Add(handlerTimeout),
+			deadline: dl,
 		})
 	})
 	if err != nil {
@@ -203,17 +206,21 @@ func (j *JetStream) startConsumer(
 
 	pool := worker.Run(consCtx, run.workers, q, func(parent context.Context, item queuedJetMsg) {
 		if time.Now().After(item.deadline) {
+			if nakErr := item.msg.Nak(); nakErr != nil && run.errorHandler != nil {
+				run.errorHandler(nakErr)
+			}
 			return
 		}
-		DispatchJetWithDeadline(parent, h, item.msg, item.deadline)
+		DispatchJetWithDeadline(parent, h, item.msg, item.deadline, run.errorHandler)
 	})
 
 	consumer := &Consumer{
-		conn:   j.conn,
-		cc:     cc,
-		q:      q,
-		cancel: cancel,
-		pool:   pool,
+		conn:         j.conn,
+		cc:           cc,
+		q:            q,
+		cancel:       cancel,
+		pool:         pool,
+		errorHandler: run.errorHandler,
 	}
 	if j.conn != nil {
 		j.conn.registerConsumer(consumer)
@@ -245,32 +252,35 @@ func DispatchJet(parent context.Context, h JetHandler, m jetstream.Msg, timeout 
 
 // DispatchJetWithDeadline runs h on m with a context having the specified deadline,
 // syncing the handler context directly with the server AckWait countdown.
-func DispatchJetWithDeadline(parent context.Context, h JetHandler, m jetstream.Msg, deadline time.Time) {
+// If an errorHandler is provided, any error returned by Ack, Nak, or Term is passed to it.
+func DispatchJetWithDeadline(parent context.Context, h JetHandler, m jetstream.Msg, deadline time.Time, errorHandler ...func(error)) {
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
 	err := h(ctx, m)
 	var nd *NakDelayError
+	var ackErr error
 	switch {
 	case ctx.Err() != nil:
 		// AckWait elapsed mid-handler (or parent canceled). Server has
 		// redelivered or will. Don't Ack (it'd be a no-op); don't Nak
 		// (would shorten the redelivery cycle for no reason).
-	case err == nil:
-		_ = m.Ack()
-	case errors.Is(err, ErrSkip):
-		_ = m.Ack()
+	case err == nil || errors.Is(err, ErrSkip):
+		ackErr = m.Ack()
 	case errors.Is(err, ErrTerminate):
 		// Explicit permanent failure signal from the handler. Pair with DLQ
 		// middleware to capture the payload before it is terminated.
-		_ = m.Term()
+		ackErr = m.Term()
 	case errors.As(err, &nd):
 		if nd.Delay > 0 {
-			_ = m.NakWithDelay(nd.Delay)
+			ackErr = m.NakWithDelay(nd.Delay)
 		} else {
-			_ = m.Nak()
+			ackErr = m.Nak()
 		}
 	default:
-		_ = m.Nak()
+		ackErr = m.Nak()
+	}
+	if ackErr != nil && len(errorHandler) > 0 && errorHandler[0] != nil {
+		errorHandler[0](ackErr)
 	}
 }
 
@@ -289,16 +299,26 @@ func (c *Consumer) Drain(ctx context.Context) error {
 
 func (c *Consumer) closeWithDrain(ctx context.Context, drain bool) error {
 	c.mu.Lock()
-	if c.closed {
-		err := c.err
+	if c.closing {
+		done := c.closeDone
 		c.mu.Unlock()
-		if drain {
-			return errors.Join(err, c.Wait(ctx))
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		return err
+		if drain {
+			return errors.Join(c.err, c.Wait(ctx))
+		}
+		return c.err
 	}
-	c.closed = true
+	c.closing = true
+	c.closeDone = make(chan struct{})
 	c.mu.Unlock()
+
+	defer func() {
+		close(c.closeDone)
+	}()
 
 	var err error
 	if drain {
@@ -336,7 +356,9 @@ func (c *Consumer) drainRemaining() {
 	for {
 		select {
 		case item := <-c.q.Recv():
-			_ = item.msg.Nak()
+			if err := item.msg.Nak(); err != nil && c.errorHandler != nil {
+				c.errorHandler(err)
+			}
 		default:
 			return
 		}

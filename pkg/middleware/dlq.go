@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	natsio "github.com/nats-io/nats.go"
@@ -19,34 +20,10 @@ const (
 	HeaderDLQReason  = "Hirnok-DLQ-Reason"
 	HeaderDLQSubject = "Hirnok-DLQ-Subject"
 	HeaderDLQAt      = "Hirnok-DLQ-At"
+
+	maxDLQReasonLen = 1024
 )
 
-// DLQ wraps a core-NATS handler: handler errors matching shouldDLQ are
-// republished to subject via conn (with diagnostic headers added), and
-// the wrapper returns nil (so the caller acks). Errors that don't match
-// shouldDLQ bubble up unchanged. ErrSkip always short-circuits — ack,
-// no DLQ publish, return nil.
-//
-// If shouldDLQ is nil, the default routes every error to DLQ EXCEPT
-// ErrSkip, context.Canceled, context.DeadlineExceeded (transient
-// "try again later" signals — don't poison the data).
-//
-// DLQ adds three headers to the republished message (HeaderDLQReason,
-// HeaderDLQSubject, HeaderDLQAt). Original headers are preserved.
-//
-// If the DLQ publish itself fails, DLQ returns the joined original + publish
-// error so an outer retry/redelivery path can recover. ErrTerminate is not
-// preserved on DLQ publish failure because JetStream dispatch would otherwise
-// treat the failure as a Term signal and drop the original message.
-//
-// Composition:
-//   - DLQ INSIDE Retry: each failed attempt is DLQ'd; Retry sees DLQ's
-//     nil return and doesn't loop. Use to short-circuit retries for
-//     known-unprocessable errors (return ErrTerminate from handler).
-//   - DLQ OUTSIDE Retry: only the final post-retry failure is DLQ'd.
-//     Use when retries are worth trying first.
-//
-// Panics if conn is nil or subject is empty.
 // DLQOption configures dead-letter message headers and behavior.
 type DLQOption func(*dlqOptions)
 
@@ -119,6 +96,9 @@ func DLQ(
 	shouldDLQ func(error) bool,
 	opts ...DLQOption,
 ) hirnok.Handler {
+	if h == nil {
+		panic("middleware: DLQ requires a non-nil handler")
+	}
 	if conn == nil {
 		panic("middleware: DLQ requires a non-nil conn")
 	}
@@ -140,6 +120,9 @@ func DLQ(
 		}
 		if !shouldDLQ(err) {
 			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 
 		out := &natsio.Msg{
@@ -166,6 +149,9 @@ func DLQJet(
 	shouldDLQ func(error) bool,
 	opts ...DLQOption,
 ) hirnok.JetHandler {
+	if h == nil {
+		panic("middleware: DLQJet requires a non-nil handler")
+	}
 	if js == nil {
 		panic("middleware: DLQJet requires a non-nil JetStream")
 	}
@@ -187,6 +173,9 @@ func DLQJet(
 		}
 		if !shouldDLQ(err) {
 			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 
 		out := &natsio.Msg{
@@ -229,7 +218,17 @@ func dlqPublishError(handlerErr error, subject string, publishErr error) error {
 }
 
 func applyDLQHeaders(h natsio.Header, err error, origSubject string, opt dlqOptions) {
-	h.Set(HeaderDLQReason, err.Error())
+	reason := err.Error()
+	if idx := strings.IndexByte(reason, '\n'); idx != -1 {
+		reason = reason[:idx]
+	}
+	if idx := strings.IndexByte(reason, '\r'); idx != -1 {
+		reason = reason[:idx]
+	}
+	if len(reason) > maxDLQReasonLen {
+		reason = reason[:maxDLQReasonLen] + "...(truncated)"
+	}
+	h.Set(HeaderDLQReason, reason)
 	h.Set(HeaderDLQSubject, origSubject)
 	h.Set(HeaderDLQAt, time.Now().UTC().Format(time.RFC3339))
 	for k, v := range opt.staticHeaders {

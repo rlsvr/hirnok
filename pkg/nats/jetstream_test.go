@@ -980,3 +980,117 @@ func TestDefaultConsumerConfig(t *testing.T) {
 		t.Errorf("expected AckWait 30s, got %v", cfg.AckWait)
 	}
 }
+
+func TestConsumer_ConcurrentStopDrainRace(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 2, QueueSize: 10})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_RACE", "race.js.>")
+
+	for i := range 5 {
+		if _, err := j.Publish(context.Background(), "race.js.x", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	cons, err := j.NewConsumer(context.Background(), "S_RACE", jetstream.ConsumerConfig{
+		Durable:       "c_race",
+		FilterSubject: "race.js.>",
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		time.Sleep(5 * time.Millisecond)
+		return nil
+	}, WithWorkers(2), WithQueueSize(10))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			if id%2 == 0 {
+				cons.Stop()
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+				_ = cons.Drain(ctx)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestConsumerExpiredQueuedMessage_NaksImmediately(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 1, QueueSize: 10})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_NAK_EXPIRED", "nak.expired.>")
+
+	for i := range 2 {
+		if _, err := j.Publish(context.Background(), "nak.expired.x", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	var processed atomic.Int32
+
+	// Short AckWait (60ms), MaxDeliver: 2
+	cons, err := j.NewConsumer(context.Background(), "S_NAK_EXPIRED", jetstream.ConsumerConfig{
+		Durable:       "c_nak_expired",
+		FilterSubject: "nak.expired.>",
+		AckWait:       60 * time.Millisecond,
+		MaxDeliver:    2,
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		n := processed.Add(1)
+		if n == 1 {
+			// Sleep longer than AckWait so message 2 expires in the queue while message 1 is running
+			time.Sleep(80 * time.Millisecond)
+		}
+		return nil
+	}, WithWorkers(1), WithQueueSize(10))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	// Wait for message 2 to expire, be Nak'd, and then redelivered & processed!
+	waitFor(t, 2*time.Second, func() bool {
+		return processed.Load() >= 2
+	})
+
+	if got := processed.Load(); got < 2 {
+		t.Fatalf("expected both messages to be processed after Nak redelivery, got %d", got)
+	}
+}
+
+func TestJetStream_WithErrorHandler(t *testing.T) {
+	s := runJSServer(t)
+	var errCalls atomic.Int32
+
+	errHook := func(_ error) {
+		errCalls.Add(1)
+	}
+
+	c := mustConnect(t, s.ClientURL(), Config{ErrorHandler: errHook})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_ERR_HOOK", "err.hook.>")
+
+	if _, err := j.Publish(context.Background(), "err.hook.x", []byte("data")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	cons, err := j.NewConsumer(context.Background(), "S_ERR_HOOK", jetstream.ConsumerConfig{
+		Durable:       "c_err_hook",
+		FilterSubject: "err.hook.>",
+	}, func(_ context.Context, _ jetstream.Msg) error {
+		return nil
+	}, WithErrorHandler(errHook))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+}

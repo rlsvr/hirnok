@@ -40,27 +40,13 @@ func (s *ChanSub[T]) Unsubscribe() error {
 // Drain stops accepting new messages, flushes remaining queued items into the
 // channel, waits for workers to finish, and closes the channel.
 func (s *ChanSub[T]) Drain(ctx context.Context) error {
-	err := s.sub.Drain(ctx)
-	if err == nil {
-		<-s.sub.Stopped()
-		s.closeOnce.Do(func() {
-			close(s.rawCh)
-		})
-	}
-	return err
+	return s.sub.Drain(ctx)
 }
 
 // Wait blocks until all worker goroutines have exited and the channel has closed,
 // or until ctx is cancelled.
 func (s *ChanSub[T]) Wait(ctx context.Context) error {
-	err := s.sub.Wait(ctx)
-	if err == nil {
-		<-s.sub.Stopped()
-		s.closeOnce.Do(func() {
-			close(s.rawCh)
-		})
-	}
-	return err
+	return s.sub.Wait(ctx)
 }
 
 // Stopped returns a channel that is closed when all workers have exited.

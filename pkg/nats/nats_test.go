@@ -667,3 +667,37 @@ func TestQueueSizeBackpressure(t *testing.T) {
 		t.Fatalf("processed=%d want 5", processed.Load())
 	}
 }
+
+func TestSub_ConcurrentStopDrainRace(t *testing.T) {
+	s := runServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{Workers: 2, QueueSize: 10})
+
+	sub, err := c.Subscribe(context.Background(), "race.stop", func(_ context.Context, _ *natsio.Msg) error {
+		time.Sleep(5 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		_ = c.Publish("race.stop", []byte("msg"))
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			if id%2 == 0 {
+				_ = sub.Stop()
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+				_ = sub.Drain(ctx)
+			}
+		}(i)
+	}
+	wg.Wait()
+}

@@ -384,6 +384,24 @@ func TestRetrySkipsNakDelayError(t *testing.T) {
 	}
 }
 
+func TestRecover_NilHandlerPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler in Recover")
+		}
+	}()
+	_ = Recover[int](nil)
+}
+
+func TestRetry_NilHandlerPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler in Retry")
+		}
+	}()
+	_ = Retry[int](nil, 3, time.Millisecond, time.Second, nil)
+}
+
 func BenchmarkRetryHappyPath(b *testing.B) {
 	h := Retry(func(_ context.Context, _ int) error {
 		return nil

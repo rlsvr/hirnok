@@ -257,3 +257,21 @@ type testFakeJetMsg struct {
 func (m *testFakeJetMsg) Data() []byte {
 	return m.data
 }
+
+func TestJSONHandler_NilHandlerPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler in JSONHandler")
+		}
+	}()
+	_ = JSONHandler[samplePayload](nil)
+}
+
+func TestJetJSONHandler_NilHandlerPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler in JetJSONHandler")
+		}
+	}()
+	_ = JetJSONHandler[samplePayload](nil)
+}

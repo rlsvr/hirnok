@@ -37,12 +37,13 @@ const (
 
 // Config holds the connect-time knobs. Anything not set has a sane default.
 type Config struct {
-	URL         string          // required, e.g. "nats://localhost:4222"
-	Name        string          // optional client name
-	QueueSize   int             // per-subscription buffer; default 64
-	Workers     int             // per-subscription worker count; default 1
-	AckBuffer   time.Duration   // JS only: handler ctx expires this much before AckWait; default = AckWait/10
-	NATSOptions []natsio.Option // appended after hirnok defaults
+	URL          string          // required, e.g. "nats://localhost:4222"
+	Name         string          // optional client name
+	QueueSize    int             // per-subscription buffer; default 64
+	Workers      int             // per-subscription worker count; default 1
+	AckBuffer    time.Duration   // JS only: handler ctx expires this much before AckWait; default = AckWait/10
+	NATSOptions  []natsio.Option // appended after hirnok defaults
+	ErrorHandler func(error)     // optional callback for background errors (e.g. Ack/Nak failures)
 }
 
 func (c Config) queueSize() int {
@@ -60,9 +61,10 @@ func (c Config) workers() int {
 }
 
 type runOptions struct {
-	queueSize int
-	workers   int
-	ackBuffer time.Duration
+	queueSize    int
+	workers      int
+	ackBuffer    time.Duration
+	errorHandler func(error)
 }
 
 // Option overrides per-subscription/per-consumer execution settings.
@@ -95,11 +97,20 @@ func WithAckBuffer(d time.Duration) Option {
 	}
 }
 
+// WithErrorHandler configures an asynchronous error callback invoked when background
+// operations (such as JetStream message Ack, Nak, or Term) fail.
+func WithErrorHandler(fn func(error)) Option {
+	return func(o *runOptions) {
+		o.errorHandler = fn
+	}
+}
+
 func (c Config) runOptions(opts []Option) runOptions {
 	o := runOptions{
-		queueSize: c.queueSize(),
-		workers:   c.workers(),
-		ackBuffer: c.AckBuffer,
+		queueSize:    c.queueSize(),
+		workers:      c.workers(),
+		ackBuffer:    c.AckBuffer,
+		errorHandler: c.ErrorHandler,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -294,14 +305,15 @@ type Handler func(ctx context.Context, m *natsio.Msg) error
 
 // Sub is a running subscription with a worker pool.
 type Sub struct {
-	conn   *Conn
-	sub    *natsio.Subscription
-	q      *queue.Queue[*natsio.Msg]
-	cancel context.CancelFunc
-	pool   *worker.Pool
-	mu     sync.Mutex
-	closed bool
-	err    error
+	conn      *Conn
+	sub       *natsio.Subscription
+	q         *queue.Queue[*natsio.Msg]
+	cancel    context.CancelFunc
+	pool      *worker.Pool
+	mu        sync.Mutex
+	closing   bool
+	closeDone chan struct{}
+	err       error
 }
 
 // Subscribe registers handler on subject and starts a worker pool. ctx
@@ -382,16 +394,26 @@ func (s *Sub) Drain(ctx context.Context) error {
 
 func (s *Sub) closeWithDrain(ctx context.Context, drain bool) error {
 	s.mu.Lock()
-	if s.closed {
-		err := s.err
+	if s.closing {
+		done := s.closeDone
 		s.mu.Unlock()
-		if drain {
-			return errors.Join(err, s.Wait(ctx))
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		return err
+		if drain {
+			return errors.Join(s.err, s.Wait(ctx))
+		}
+		return s.err
 	}
-	s.closed = true
+	s.closing = true
+	s.closeDone = make(chan struct{})
 	s.mu.Unlock()
+
+	defer func() {
+		close(s.closeDone)
+	}()
 
 	err := s.sub.Unsubscribe()
 	s.q.Close()

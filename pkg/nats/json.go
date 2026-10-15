@@ -35,11 +35,17 @@ func WithCustomDecoder(fn func([]byte, any) error) JSONOption {
 	}
 }
 
-func decodeJSONPayload[T any](data []byte, payload *T, opts []JSONOption) error {
+func buildJSONConfig(opts []JSONOption) JSONConfig {
 	var cfg JSONConfig
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
+	return cfg
+}
+
+func decodeJSONPayload[T any](data []byte, payload *T, cfg JSONConfig) error {
 	if cfg.CustomDecoder != nil {
 		return cfg.CustomDecoder(data, payload)
 	}
@@ -56,13 +62,17 @@ func decodeJSONPayload[T any](data []byte, payload *T, opts []JSONOption) error 
 // returns an error joined with ErrTerminate, signaling that the malformed payload
 // cannot be processed and should not be retried.
 func JSONHandler[T any](h func(context.Context, *natsio.Msg, T) error, opts ...JSONOption) Handler {
+	if h == nil {
+		panic("nats: JSONHandler requires a non-nil handler")
+	}
+	cfg := buildJSONConfig(opts)
 	return func(ctx context.Context, m *natsio.Msg) error {
 		var payload T
 		var data []byte
 		if m != nil {
 			data = m.Data
 		}
-		if err := decodeJSONPayload(data, &payload, opts); err != nil {
+		if err := decodeJSONPayload(data, &payload, cfg); err != nil {
 			return fmt.Errorf("json unmarshal (%T): %w", payload, errors.Join(err, ErrTerminate))
 		}
 		return h(ctx, m, payload)
@@ -74,13 +84,17 @@ func JSONHandler[T any](h func(context.Context, *natsio.Msg, T) error, opts ...J
 // returns an error joined with ErrTerminate, causing JetStream to Term the poison
 // message instead of redelivering indefinitely.
 func JetJSONHandler[T any](h func(context.Context, jetstream.Msg, T) error, opts ...JSONOption) JetHandler {
+	if h == nil {
+		panic("nats: JetJSONHandler requires a non-nil handler")
+	}
+	cfg := buildJSONConfig(opts)
 	return func(ctx context.Context, m jetstream.Msg) error {
 		var payload T
 		var data []byte
 		if m != nil {
 			data = m.Data()
 		}
-		if err := decodeJSONPayload(data, &payload, opts); err != nil {
+		if err := decodeJSONPayload(data, &payload, cfg); err != nil {
 			return fmt.Errorf("json unmarshal (%T): %w", payload, errors.Join(err, ErrTerminate))
 		}
 		return h(ctx, m, payload)
