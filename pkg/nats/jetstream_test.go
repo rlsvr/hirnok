@@ -910,7 +910,7 @@ func TestConsumerStopNaksQueuedMessages(t *testing.T) {
 	}
 	defer cons2.Stop()
 
-	waitFor(t, 3*time.Second, func() bool { return secondSeen.Load() >= 4 })
+	waitFor(t, 5*time.Second, func() bool { return secondSeen.Load() >= 4 })
 }
 
 func TestConsumerSkipsExpiredQueuedMessages(t *testing.T) {

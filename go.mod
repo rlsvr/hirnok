@@ -1,11 +1,11 @@
 module github.com/rlsvr/hirnok
 
-go 1.26.1
+go 1.25.0
 
 require (
 	github.com/nats-io/nats-server/v2 v2.14.0
 	github.com/nats-io/nats.go v1.52.0
-	github.com/rlsvr/inas v0.0.0-20261015075505-f8590d145b16
+	github.com/rlsvr/inas v0.0.0-20261015133457-2adcd58f8062
 	github.com/sethvargo/go-retry v0.3.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/sdk v1.43.0

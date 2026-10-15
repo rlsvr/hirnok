@@ -109,7 +109,7 @@ func TestJSONHandler(t *testing.T) {
 				t.Fatalf("unexpected id: %s", p.ID)
 			}
 			return nil
-		}, WithCustomDecoder(func(b []byte, v any) error {
+		}, WithCustomDecoder(func(_ []byte, v any) error {
 			customCalled = true
 			p, ok := v.(*samplePayload)
 			if !ok {
