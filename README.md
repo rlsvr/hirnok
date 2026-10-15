@@ -3,6 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/rlsvr/hirnok.svg)](https://pkg.go.dev/github.com/rlsvr/hirnok)
 [![CI](https://github.com/rlsvr/hirnok/actions/workflows/ci.yml/badge.svg)](https://github.com/rlsvr/hirnok/actions/workflows/ci.yml)
 [![golangci-lint](https://img.shields.io/badge/golangci--lint-passing-brightgreen?logo=go)](https://github.com/rlsvr/hirnok/actions/workflows/ci.yml)
+[![govulncheck](https://img.shields.io/badge/govulncheck-passing-brightgreen?logo=go)](https://github.com/rlsvr/hirnok/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 A small Go library for NATS handlers with bounded queues, worker pools, and
