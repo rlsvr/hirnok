@@ -891,7 +891,7 @@ func TestConsumerStopNaksQueuedMessages(t *testing.T) {
 	}
 
 	waitFor(t, 2*time.Second, func() bool { return processed.Load() == 1 })
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	cons.Stop()
 	close(blockHandler)
