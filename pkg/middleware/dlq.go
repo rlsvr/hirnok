@@ -9,7 +9,7 @@ import (
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // Header names attached to DLQ-republished messages so operators can
@@ -113,12 +113,12 @@ func parseDLQOptions(opts []DLQOption) dlqOptions {
 //
 // Panics if conn is nil or subject is empty.
 func DLQ(
-	h qpnats.Handler,
-	conn *qpnats.Conn,
+	h hirnok.Handler,
+	conn *hirnok.Conn,
 	subject string,
 	shouldDLQ func(error) bool,
 	opts ...DLQOption,
-) qpnats.Handler {
+) hirnok.Handler {
 	if conn == nil {
 		panic("middleware: DLQ requires a non-nil conn")
 	}
@@ -135,7 +135,7 @@ func DLQ(
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, qpnats.ErrSkip) {
+		if errors.Is(err, hirnok.ErrSkip) {
 			return nil
 		}
 		if !shouldDLQ(err) {
@@ -160,12 +160,12 @@ func DLQ(
 // *JetStream.PublishMsg (durable). Same semantics. Panics if js is nil
 // or subject is empty.
 func DLQJet(
-	h qpnats.JetHandler,
-	js *qpnats.JetStream,
+	h hirnok.JetHandler,
+	js *hirnok.JetStream,
 	subject string,
 	shouldDLQ func(error) bool,
 	opts ...DLQOption,
-) qpnats.JetHandler {
+) hirnok.JetHandler {
 	if js == nil {
 		panic("middleware: DLQJet requires a non-nil JetStream")
 	}
@@ -182,7 +182,7 @@ func DLQJet(
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, qpnats.ErrSkip) {
+		if errors.Is(err, hirnok.ErrSkip) {
 			return nil
 		}
 		if !shouldDLQ(err) {
@@ -207,8 +207,8 @@ func DLQJet(
 // "try again later" (ctx errors, NakDelayError) or "intentionally skip" (ErrSkip).
 // ErrTerminate is DLQ'd — that's its point.
 func DefaultShouldDLQ(err error) bool {
-	var nd *qpnats.NakDelayError
-	if errors.Is(err, qpnats.ErrSkip) || errors.As(err, &nd) {
+	var nd *hirnok.NakDelayError
+	if errors.Is(err, hirnok.ErrSkip) || errors.As(err, &nd) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -219,7 +219,7 @@ func DefaultShouldDLQ(err error) bool {
 
 func dlqPublishError(handlerErr error, subject string, publishErr error) error {
 	publishErr = fmt.Errorf("dlq publish %q: %w", subject, publishErr)
-	if errors.Is(handlerErr, qpnats.ErrTerminate) {
+	if errors.Is(handlerErr, hirnok.ErrTerminate) {
 		// If a DLQ write fails, do not preserve ErrTerminate in the returned
 		// error. JetStream dispatch treats ErrTerminate as a Term signal; the
 		// right recovery path for failed DLQ writes is redelivery.

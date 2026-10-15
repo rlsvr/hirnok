@@ -17,7 +17,7 @@ import (
 
 	natsio "github.com/nats-io/nats.go"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 func main() {
@@ -38,7 +38,7 @@ func main() {
 }
 
 func run(url string, workers, queueSize, burst int, idle time.Duration, payloadSize int) error {
-	conn, err := qpnats.Connect(qpnats.Config{
+	conn, err := hirnok.Connect(hirnok.Config{
 		URL:       url,
 		Name:      "hirnok-stress-burst",
 		QueueSize: queueSize,

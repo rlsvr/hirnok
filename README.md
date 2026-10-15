@@ -41,10 +41,10 @@ import (
     "log"
 
     natsio "github.com/nats-io/nats.go"
-    qpnats "github.com/rlsvr/hirnok/pkg/nats"
+    hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
-conn, err := qpnats.Connect(qpnats.Config{
+conn, err := hirnok.Connect(hirnok.Config{
     URL:       "nats://localhost:4222",
     Name:      "orders-api",
     QueueSize: 64,
@@ -90,7 +90,7 @@ if err := conn.PublishMsg(msg); err != nil {
 When building streaming pipelines that consume messages via Go channels:
 
 ```go
-sub, err := qpnats.SubscribeChan(ctx, conn, "market.ticks", 128)
+sub, err := hirnok.SubscribeChan(ctx, conn, "market.ticks", 128)
 if err != nil {
     panic(err)
 }
@@ -104,7 +104,7 @@ for msg := range sub.C() {
 Or stream typed JSON models directly, discarding poison payloads:
 
 ```go
-sub, err := qpnats.SubscribeChanJSON[Tick](ctx, conn, "market.ticks", 128)
+sub, err := hirnok.SubscribeChanJSON[Tick](ctx, conn, "market.ticks", 128)
 for tick := range sub.C() {
     processTick(tick)
 }
@@ -121,7 +121,7 @@ if err != nil {
     panic(err)
 }
 
-// Access parent *qpnats.Conn at any time:
+// Access parent *hirnok.Conn at any time:
 rootConn := js.Conn()
 
 _, _ = js.Raw().CreateOrUpdateStream(ctx, jetstream.StreamConfig{
@@ -138,7 +138,7 @@ start with standard defaults (explicit ack, deliver all, 30s ack wait) and overr
 only what is specific to your consumer:
 
 ```go
-cfg := qpnats.DefaultConsumerConfig("orders-worker")
+cfg := hirnok.DefaultConsumerConfig("orders-worker")
 cfg.FilterSubject = "orders.>"
 
 cons, err := js.NewConsumer(ctx, "ORDERS", cfg, func(ctx context.Context, m jetstream.Msg) error {
@@ -227,7 +227,7 @@ about to be redelivered.
 Connection-level defaults:
 
 ```go
-conn, _ := qpnats.Connect(qpnats.Config{
+conn, _ := hirnok.Connect(hirnok.Config{
     URL:       "nats://localhost:4222",
     QueueSize: 128,
     Workers:   8,
@@ -242,14 +242,14 @@ Override queue and worker settings per subscription or consumer:
 
 ```go
 sub, err := conn.Subscribe(ctx, "events.*", handle,
-    qpnats.WithQueueSize(256),
-    qpnats.WithWorkers(4),
+    hirnok.WithQueueSize(256),
+    hirnok.WithWorkers(4),
 )
 
 cons, err := js.NewConsumer(ctx, "ORDERS", cfg, handleJet,
-    qpnats.WithQueueSize(512),
-    qpnats.WithWorkers(16),
-    qpnats.WithAckBuffer(2*time.Second),
+    hirnok.WithQueueSize(512),
+    hirnok.WithWorkers(16),
+    hirnok.WithAckBuffer(2*time.Second),
 )
 ```
 
@@ -273,21 +273,21 @@ to compose middleware pipelines cleanly without deeply nested function calls:
 
 ```go
 import (
-    qpmw "github.com/rlsvr/hirnok/pkg/middleware"
-    qpotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
+    "github.com/rlsvr/hirnok/pkg/middleware"
+    hirnokotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
 )
 
-chain := qpmw.Chain(
-    func(h qpnats.JetHandler) qpnats.JetHandler { return qpmw.Recover(h) },
-    func(h qpnats.JetHandler) qpnats.JetHandler { return qpotel.TraceJet(h, tracer) },
-    func(h qpnats.JetHandler) qpnats.JetHandler {
-        return qpmw.DLQJet(h, js, "orders.dlq", nil,
-            qpmw.WithDLQHeaders(map[string]string{"service": "orders-worker"}),
+chain := middleware.Chain(
+    func(h hirnok.JetHandler) hirnok.JetHandler { return middleware.Recover(h) },
+    func(h hirnok.JetHandler) hirnok.JetHandler { return hirnokotel.TraceJet(h, tracer) },
+    func(h hirnok.JetHandler) hirnok.JetHandler {
+        return middleware.DLQJet(h, js, "orders.dlq", nil,
+            middleware.WithDLQHeaders(map[string]string{"service": "orders-worker"}),
         )
     },
-    func(h qpnats.JetHandler) qpnats.JetHandler {
-        shouldRetry := qpmw.WithNonRetryable(isSentinelError)
-        return qpmw.Retry(h, 3, 100*time.Millisecond, 5*time.Second, shouldRetry)
+    func(h hirnok.JetHandler) hirnok.JetHandler {
+        shouldRetry := middleware.WithNonRetryable(isSentinelError)
+        return middleware.Retry(h, 3, 100*time.Millisecond, 5*time.Second, shouldRetry)
     },
 )
 
@@ -305,11 +305,11 @@ The default retry filter `DefaultShouldRetry` skips `context.Canceled`, `context
 Extend the default retry predicate with custom non-retryable errors using `WithNonRetryable`:
 
 ```go
-filter := qpmw.WithNonRetryable(
+filter := middleware.WithNonRetryable(
     func(err error) bool { return errors.Is(err, ErrInvalidInput) },
     func(err error) bool { return errors.Is(err, ErrUnauthorized) },
 )
-retryMW := qpmw.Retry(handle, 3, 100*time.Millisecond, 2*time.Second, filter)
+retryMW := middleware.Retry(handle, 3, 100*time.Millisecond, 2*time.Second, filter)
 ```
 
 ### Dead Letter Queue (DLQ)
@@ -320,8 +320,8 @@ diagnostic headers (`X-DLQ-Original-Subject`, `X-DLQ-Reason`, `X-DLQ-Time`).
 Customize headers using `WithDLQHeaders` or dynamic callbacks `WithDLQHeaderFunc`:
 
 ```go
-h := qpmw.DLQJet(handleOrder, js, "orders.dlq", nil,
-    qpmw.WithDLQHeaders(map[string]string{
+h := middleware.DLQJet(handleOrder, js, "orders.dlq", nil,
+    middleware.WithDLQHeaders(map[string]string{
         "topic_poisoned":   "orders.placed",
         "handler_poisoned": "orders-worker",
     }),
@@ -337,13 +337,13 @@ Instead of manually unmarshaling JSON and handling poison payloads in every hand
 use `JSONHandler` (for Core NATS) or `JetJSONHandler` (for JetStream):
 
 ```go
-h := qpnats.JetJSONHandler[OrderEvent](func(ctx context.Context, m jetstream.Msg, event OrderEvent) error {
+h := hirnok.JetJSONHandler[OrderEvent](func(ctx context.Context, m jetstream.Msg, event OrderEvent) error {
     return processOrder(ctx, event)
 })
 ```
 
 `JetJSONHandler` decodes `m.Data()` into `OrderEvent`. If `json.Unmarshal` fails, it
-returns an error joined with `qpnats.ErrTerminate`, causing JetStream to immediately
+returns an error joined with `hirnok.ErrTerminate`, causing JetStream to immediately
 `Term()` the poison message instead of repeatedly redelivering it.
 
 ## OpenTelemetry
@@ -353,13 +353,13 @@ pull OpenTelemetry dependencies into applications that do not use them.
 
 ```go
 import (
-    qpmw "github.com/rlsvr/hirnok/pkg/middleware"
-    qpotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
+    "github.com/rlsvr/hirnok/pkg/middleware"
+    hirnokotel "github.com/rlsvr/hirnok/pkg/middleware/otel"
     "go.opentelemetry.io/otel"
 )
 
 tracer := otel.Tracer("orders-api")
-h := qpmw.Recover(qpotel.TraceJet(handleOrder, tracer))
+h := middleware.Recover(hirnokotel.TraceJet(handleOrder, tracer))
 
 cons, err := js.NewConsumer(ctx, "ORDERS", cfg, h)
 ```
@@ -371,7 +371,7 @@ msg := &natsio.Msg{Subject: "orders.created", Data: payload}
 ctx, span := tracer.Start(ctx, "nats.publish")
 defer span.End()
 
-qpotel.Inject(ctx, msg)
+hirnokotel.Inject(ctx, msg)
 _, err := js.PublishMsg(ctx, msg)
 ```
 
@@ -390,7 +390,7 @@ import (
 q := queue.New[jetstream.Msg](64)
 
 pool := worker.Run(ctx, 4, q, func(ctx context.Context, m jetstream.Msg) {
-    qpnats.DispatchJet(ctx, handle, m, 25*time.Second)
+    hirnok.DispatchJet(ctx, handle, m, 25*time.Second)
 })
 
 stopSource, err := mySource.Subscribe(func(m jetstream.Msg) {

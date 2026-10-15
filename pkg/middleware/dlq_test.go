@@ -14,7 +14,7 @@ import (
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // ---------------- helpers ----------------
@@ -37,9 +37,9 @@ func runJSServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
-func mustConnect(t *testing.T, url string) *qpnats.Conn {
+func mustConnect(t *testing.T, url string) *hirnok.Conn {
 	t.Helper()
-	c, err := qpnats.Connect(qpnats.Config{URL: url})
+	c, err := hirnok.Connect(hirnok.Config{URL: url})
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -49,7 +49,7 @@ func mustConnect(t *testing.T, url string) *qpnats.Conn {
 
 // captureDLQ subscribes to subject via the raw nats.go connection and
 // returns a channel that yields each received *nats.Msg.
-func captureDLQ(t *testing.T, c *qpnats.Conn, subject string) <-chan *natsio.Msg {
+func captureDLQ(t *testing.T, c *hirnok.Conn, subject string) <-chan *natsio.Msg {
 	t.Helper()
 	ch := make(chan *natsio.Msg, 4)
 	sub, err := c.Raw().Subscribe(subject, func(m *natsio.Msg) {
@@ -171,7 +171,7 @@ func TestDLQErrSkipShortCircuits(t *testing.T) {
 	c := mustConnect(t, s.ClientURL())
 	dlq := captureDLQ(t, c, "dlq.skip")
 
-	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return qpnats.ErrSkip },
+	h := DLQ(func(_ context.Context, _ *natsio.Msg) error { return hirnok.ErrSkip },
 		c, "dlq.skip", nil)
 
 	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
@@ -249,12 +249,12 @@ func TestDLQDefaultSkipsNakDelay(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.nakdelay")
 
 	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
-		return qpnats.NakWithDelay(errors.New("db busy"), 5*time.Second)
+		return hirnok.NakWithDelay(errors.New("db busy"), 5*time.Second)
 	}, c, "dlq.nakdelay", nil)
 
 	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
 	err := h(context.Background(), m)
-	var nd *qpnats.NakDelayError
+	var nd *hirnok.NakDelayError
 	if !errors.As(err, &nd) {
 		t.Fatalf("err = %v, want NakDelayError", err)
 	}
@@ -271,7 +271,7 @@ func TestDLQErrTerminateIsDLQd(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.term")
 
 	h := DLQ(func(_ context.Context, _ *natsio.Msg) error {
-		return fmt.Errorf("bad: %w", qpnats.ErrTerminate)
+		return fmt.Errorf("bad: %w", hirnok.ErrTerminate)
 	}, c, "dlq.term", nil)
 
 	m := &natsio.Msg{Subject: "s", Data: []byte("d"), Header: natsio.Header{}}
@@ -312,11 +312,11 @@ func TestDLQPublishFailureReturnsJoined(t *testing.T) {
 
 func TestDLQPublishFailureStripsErrTerminate(t *testing.T) {
 	err := dlqPublishError(
-		fmt.Errorf("bad payload: %w", qpnats.ErrTerminate),
+		fmt.Errorf("bad payload: %w", hirnok.ErrTerminate),
 		"dlq.term",
 		errors.New("publish connection closed"),
 	)
-	if errors.Is(err, qpnats.ErrTerminate) {
+	if errors.Is(err, hirnok.ErrTerminate) {
 		t.Fatalf("publish failure error should not preserve ErrTerminate: %v", err)
 	}
 	if !strings.Contains(err.Error(), "terminate") {
@@ -363,7 +363,7 @@ func TestDLQJetPublishesOnError(t *testing.T) {
 	dlq := captureDLQ(t, c, "dlq.js.x")
 
 	h := DLQJet(func(_ context.Context, _ jetstream.Msg) error {
-		return fmt.Errorf("unprocessable: %w", qpnats.ErrTerminate)
+		return fmt.Errorf("unprocessable: %w", hirnok.ErrTerminate)
 	}, j, "dlq.js.x", nil)
 
 	// Build a stub jetstream.Msg with everything DLQ needs.
@@ -479,7 +479,7 @@ func TestErrTerminateBypassesRetry(t *testing.T) {
 	var calls atomic.Int32
 	inner := func(_ context.Context, _ *natsio.Msg) error {
 		calls.Add(1)
-		return fmt.Errorf("bad payload: %w", qpnats.ErrTerminate)
+		return fmt.Errorf("bad payload: %w", hirnok.ErrTerminate)
 	}
 	h := Retry(DLQ(inner, c, "dlq.terminate", nil), 5, time.Millisecond, 0, nil)
 

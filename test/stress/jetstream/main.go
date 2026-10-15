@@ -17,7 +17,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 func main() {
@@ -38,7 +38,7 @@ func main() {
 }
 
 func run(url string, workers, total, queueSize, payloadSize int, ackWait time.Duration) error {
-	conn, err := qpnats.Connect(qpnats.Config{
+	conn, err := hirnok.Connect(hirnok.Config{
 		URL:       url,
 		Name:      "hirnok-stress-js",
 		QueueSize: queueSize,

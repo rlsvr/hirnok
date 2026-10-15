@@ -23,7 +23,7 @@ import (
 
 	"github.com/sethvargo/go-retry"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // PanicError is returned by Recover when a handler panics. It contains the
@@ -145,8 +145,8 @@ func Retry[M any](
 // DefaultShouldRetry is hirnok's default retry filter. It retries all errors
 // EXCEPT context.Canceled, context.DeadlineExceeded, ErrTerminate, ErrSkip, and NakDelayError.
 func DefaultShouldRetry(err error) bool {
-	var nd *qpnats.NakDelayError
-	if errors.Is(err, qpnats.ErrTerminate) || errors.Is(err, qpnats.ErrSkip) || errors.As(err, &nd) {
+	var nd *hirnok.NakDelayError
+	if errors.Is(err, hirnok.ErrTerminate) || errors.Is(err, hirnok.ErrSkip) || errors.As(err, &nd) {
 		return false
 	}
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)

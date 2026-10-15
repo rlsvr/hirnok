@@ -16,7 +16,7 @@ import (
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 const (
@@ -38,7 +38,7 @@ func run() error {
 		url = defaultURL
 	}
 
-	conn, err := qpnats.Connect(qpnats.Config{
+	conn, err := hirnok.Connect(hirnok.Config{
 		URL:       url,
 		Name:      "hirnok-smoke",
 		QueueSize: 32,
@@ -59,7 +59,7 @@ func run() error {
 	return nil
 }
 
-func coreRoundTrip(conn *qpnats.Conn) error {
+func coreRoundTrip(conn *hirnok.Conn) error {
 	const total = 20
 	received := make(chan *natsio.Msg, total)
 
@@ -106,7 +106,7 @@ func coreRoundTrip(conn *qpnats.Conn) error {
 	return nil
 }
 
-func jetRoundTrip(conn *qpnats.Conn) error {
+func jetRoundTrip(conn *hirnok.Conn) error {
 	const total = 20
 	js, err := conn.JetStream()
 	if err != nil {

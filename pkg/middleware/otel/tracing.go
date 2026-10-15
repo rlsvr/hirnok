@@ -11,7 +11,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 const (
@@ -31,7 +31,7 @@ const (
 // span continues the caller's trace. The new span is attached to ctx
 // and threaded into the handler. Handler errors are recorded on the
 // span (RecordError + Error status).
-func Trace(h qpnats.Handler, tracer trace.Tracer) qpnats.Handler {
+func Trace(h hirnok.Handler, tracer trace.Tracer) hirnok.Handler {
 	return func(ctx context.Context, m *natsio.Msg) error {
 		var header natsio.Header
 		if m != nil {
@@ -60,7 +60,7 @@ func Trace(h qpnats.Handler, tracer trace.Tracer) qpnats.Handler {
 }
 
 // TraceJet is the JetStream equivalent of Trace.
-func TraceJet(h qpnats.JetHandler, tracer trace.Tracer) qpnats.JetHandler {
+func TraceJet(h hirnok.JetHandler, tracer trace.Tracer) hirnok.JetHandler {
 	return func(ctx context.Context, m jetstream.Msg) error {
 		var header natsio.Header
 		if m != nil {

@@ -12,7 +12,7 @@ import (
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	qpnats "github.com/rlsvr/hirnok/pkg/nats"
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // ---------------- Recover ----------------
@@ -178,11 +178,11 @@ func TestRetryDefaultSkipsErrTerminate(t *testing.T) {
 	var calls atomic.Int32
 	h := Retry(func(_ context.Context, _ int) error {
 		calls.Add(1)
-		return fmt.Errorf("bad payload: %w", qpnats.ErrTerminate)
+		return fmt.Errorf("bad payload: %w", hirnok.ErrTerminate)
 	}, 5, time.Millisecond, 0, nil)
 
 	err := h(context.Background(), 0)
-	if !errors.Is(err, qpnats.ErrTerminate) {
+	if !errors.Is(err, hirnok.ErrTerminate) {
 		t.Fatalf("err = %v, want ErrTerminate", err)
 	}
 	if got := calls.Load(); got != 1 {
@@ -194,11 +194,11 @@ func TestRetryDefaultSkipsErrSkip(t *testing.T) {
 	var calls atomic.Int32
 	h := Retry(func(_ context.Context, _ int) error {
 		calls.Add(1)
-		return qpnats.ErrSkip
+		return hirnok.ErrSkip
 	}, 5, time.Millisecond, 0, nil)
 
 	err := h(context.Background(), 0)
-	if !errors.Is(err, qpnats.ErrSkip) {
+	if !errors.Is(err, hirnok.ErrSkip) {
 		t.Fatalf("err = %v, want ErrSkip", err)
 	}
 	if got := calls.Load(); got != 1 {
@@ -323,7 +323,7 @@ func TestWithNonRetryable(t *testing.T) {
 	if predicate(context.Canceled) {
 		t.Fatal("expected context.Canceled to be non-retryable")
 	}
-	if predicate(qpnats.ErrTerminate) {
+	if predicate(hirnok.ErrTerminate) {
 		t.Fatal("expected ErrTerminate to be non-retryable")
 	}
 
@@ -336,9 +336,9 @@ func TestWithNonRetryable(t *testing.T) {
 // ---------------- Integration with pkg/nats types ----------------
 
 func TestRecoverAssignableToNatsHandler(t *testing.T) {
-	var coreH qpnats.Handler = func(_ context.Context, _ *natsio.Msg) error { return nil }
+	var coreH hirnok.Handler = func(_ context.Context, _ *natsio.Msg) error { return nil }
 
-	var wrapped qpnats.Handler = Recover(coreH)
+	var wrapped hirnok.Handler = Recover(coreH)
 
 	m := &natsio.Msg{Subject: "t", Data: []byte("x")}
 	if err := wrapped(context.Background(), m); err != nil {
@@ -348,14 +348,14 @@ func TestRecoverAssignableToNatsHandler(t *testing.T) {
 
 func TestRetryAssignableToJetHandler(t *testing.T) {
 	var calls atomic.Int32
-	var jetH qpnats.JetHandler = func(_ context.Context, _ jetstream.Msg) error {
+	var jetH hirnok.JetHandler = func(_ context.Context, _ jetstream.Msg) error {
 		if calls.Add(1) < 2 {
 			return errors.New("transient")
 		}
 		return nil
 	}
 
-	var wrapped qpnats.JetHandler = Retry(jetH, 3, time.Millisecond, 0, nil)
+	var wrapped hirnok.JetHandler = Retry(jetH, 3, time.Millisecond, 0, nil)
 
 	// Verify the assignment compiles AND the wrapper still drives the
 	// handler. nil jetstream.Msg is fine — our test handler ignores it.
@@ -371,11 +371,11 @@ func TestRetrySkipsNakDelayError(t *testing.T) {
 	var calls atomic.Int32
 	h := Retry(func(_ context.Context, _ int) error {
 		calls.Add(1)
-		return qpnats.NakWithDelay(errors.New("db busy"), 5*time.Second)
+		return hirnok.NakWithDelay(errors.New("db busy"), 5*time.Second)
 	}, 5, time.Millisecond, 0, nil)
 
 	err := h(context.Background(), 0)
-	var nd *qpnats.NakDelayError
+	var nd *hirnok.NakDelayError
 	if !errors.As(err, &nd) {
 		t.Fatalf("err = %v, want NakDelayError", err)
 	}
