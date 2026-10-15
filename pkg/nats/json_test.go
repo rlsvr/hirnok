@@ -83,6 +83,50 @@ func TestJSONHandler(t *testing.T) {
 			t.Fatalf("expected sentinel, got %v", err)
 		}
 	})
+
+	t.Run("disallow unknown fields rejects unexpected keys", func(t *testing.T) {
+		t.Parallel()
+		handler := JSONHandler[samplePayload](func(_ context.Context, _ *natsio.Msg, _ samplePayload) error {
+			t.Fatal("handler should not be called when unknown fields present")
+			return nil
+		}, WithDisallowUnknownFields())
+
+		msg := &natsio.Msg{Data: []byte(`{"id":"1","val":10,"unexpected_extra":"bad"}`)}
+		err := handler(context.Background(), msg)
+		if err == nil {
+			t.Fatal("expected error for payload with unknown fields")
+		}
+		if !errors.Is(err, ErrTerminate) {
+			t.Fatalf("expected ErrTerminate, got: %v", err)
+		}
+	})
+
+	t.Run("custom decoder option", func(t *testing.T) {
+		t.Parallel()
+		customCalled := false
+		handler := JSONHandler[samplePayload](func(_ context.Context, _ *natsio.Msg, p samplePayload) error {
+			if p.ID != "custom-id" {
+				t.Fatalf("unexpected id: %s", p.ID)
+			}
+			return nil
+		}, WithCustomDecoder(func(b []byte, v any) error {
+			customCalled = true
+			p, ok := v.(*samplePayload)
+			if !ok {
+				t.Fatalf("unexpected target type: %T", v)
+			}
+			p.ID = "custom-id"
+			return nil
+		}))
+
+		msg := &natsio.Msg{Data: []byte(`{}`)}
+		if err := handler(context.Background(), msg); err != nil {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+		if !customCalled {
+			t.Fatal("custom decoder was not invoked")
+		}
+	})
 }
 
 func TestJetJSONHandler(t *testing.T) {

@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,18 +11,58 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// JSONConfig holds configuration for JSON decoding in JSONHandler and JetJSONHandler.
+type JSONConfig struct {
+	DisallowUnknown bool
+	CustomDecoder   func([]byte, any) error
+}
+
+// JSONOption configures JSON decoding behavior.
+type JSONOption func(*JSONConfig)
+
+// WithDisallowUnknownFields configures the decoder to reject payloads containing
+// fields not present in the target struct.
+func WithDisallowUnknownFields() JSONOption {
+	return func(c *JSONConfig) {
+		c.DisallowUnknown = true
+	}
+}
+
+// WithCustomDecoder sets a custom decoder function for unmarshaling JSON bytes.
+func WithCustomDecoder(fn func([]byte, any) error) JSONOption {
+	return func(c *JSONConfig) {
+		c.CustomDecoder = fn
+	}
+}
+
+func decodeJSONPayload[T any](data []byte, payload *T, opts []JSONOption) error {
+	var cfg JSONConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.CustomDecoder != nil {
+		return cfg.CustomDecoder(data, payload)
+	}
+	if cfg.DisallowUnknown {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
+		return dec.Decode(payload)
+	}
+	return json.Unmarshal(data, payload)
+}
+
 // JSONHandler wraps a typed handler for Core NATS. It decodes m.Data as JSON
-// into T and passes the decoded payload to h. If json.Unmarshal fails, it
+// into T and passes the decoded payload to h. If decoding fails, it
 // returns an error joined with ErrTerminate, signaling that the malformed payload
 // cannot be processed and should not be retried.
-func JSONHandler[T any](h func(context.Context, *natsio.Msg, T) error) Handler {
+func JSONHandler[T any](h func(context.Context, *natsio.Msg, T) error, opts ...JSONOption) Handler {
 	return func(ctx context.Context, m *natsio.Msg) error {
 		var payload T
 		var data []byte
 		if m != nil {
 			data = m.Data
 		}
-		if err := json.Unmarshal(data, &payload); err != nil {
+		if err := decodeJSONPayload(data, &payload, opts); err != nil {
 			return fmt.Errorf("json unmarshal (%T): %w", payload, errors.Join(err, ErrTerminate))
 		}
 		return h(ctx, m, payload)
@@ -29,17 +70,17 @@ func JSONHandler[T any](h func(context.Context, *natsio.Msg, T) error) Handler {
 }
 
 // JetJSONHandler wraps a typed handler for JetStream. It decodes m.Data() as JSON
-// into T and passes the decoded payload to h. If json.Unmarshal fails, it
+// into T and passes the decoded payload to h. If decoding fails, it
 // returns an error joined with ErrTerminate, causing JetStream to Term the poison
 // message instead of redelivering indefinitely.
-func JetJSONHandler[T any](h func(context.Context, jetstream.Msg, T) error) JetHandler {
+func JetJSONHandler[T any](h func(context.Context, jetstream.Msg, T) error, opts ...JSONOption) JetHandler {
 	return func(ctx context.Context, m jetstream.Msg) error {
 		var payload T
 		var data []byte
 		if m != nil {
 			data = m.Data()
 		}
-		if err := json.Unmarshal(data, &payload); err != nil {
+		if err := decodeJSONPayload(data, &payload, opts); err != nil {
 			return fmt.Errorf("json unmarshal (%T): %w", payload, errors.Join(err, ErrTerminate))
 		}
 		return h(ctx, m, payload)
