@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/nats-io/nats-server/v2 v2.14.0
 	github.com/nats-io/nats.go v1.52.0
-	github.com/rlsvr/inas v0.0.0-20261016034335-a59c88b503f7
+	github.com/rlsvr/inas v0.0.0-20261016090819-ba51006c198b
 	github.com/sethvargo/go-retry v0.3.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
