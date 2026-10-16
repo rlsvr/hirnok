@@ -309,6 +309,7 @@ type Sub struct {
 	sub       *natsio.Subscription
 	q         *queue.Queue[*natsio.Msg]
 	cancel    context.CancelFunc
+	stopAfter func() bool
 	pool      *worker.Pool
 	mu        sync.Mutex
 	closing   bool
@@ -370,6 +371,11 @@ func (c *Conn) startSub(ctx context.Context, subject, group string, h Handler, o
 		pool:   pool,
 	}
 	c.registerSub(sub)
+	sub.mu.Lock()
+	sub.stopAfter = context.AfterFunc(ctx, func() {
+		_ = sub.Stop()
+	})
+	sub.mu.Unlock()
 	return sub, nil
 }
 
@@ -409,6 +415,9 @@ func (s *Sub) closeWithDrain(ctx context.Context, drain bool) error {
 	}
 	s.closing = true
 	s.closeDone = make(chan struct{})
+	if s.stopAfter != nil {
+		s.stopAfter()
+	}
 	s.mu.Unlock()
 
 	defer func() {

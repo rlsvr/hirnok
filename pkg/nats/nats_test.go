@@ -451,6 +451,9 @@ func TestSubscribeRespectsContext(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("workers did not stop after ctx cancel")
 	}
+	waitFor(t, time.Second, func() bool {
+		return len(c.subscriptions()) == 0 && !sub.sub.IsValid()
+	})
 }
 
 func TestSubWaitUnblocksAfterUnsubscribe(t *testing.T) {

@@ -15,6 +15,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+
+	hirnok "github.com/rlsvr/hirnok/pkg/nats"
 )
 
 // ---------------- test setup ----------------
@@ -302,6 +304,53 @@ func TestHeaderCarrierSetNilHeaderDoesNotPanic(t *testing.T) {
 	}
 	if len(c.Keys()) != 0 {
 		t.Fatalf("Keys on nil carrier returned %v", c.Keys())
+	}
+}
+
+func TestTraceNilHandlerPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected Trace(nil, ...) to panic")
+		}
+	}()
+	_ = Trace(nil, nil)
+}
+
+func TestTraceJetNilHandlerPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected TraceJet(nil, ...) to panic")
+		}
+	}()
+	_ = TraceJet(nil, nil)
+}
+
+func TestTraceNilTracerAndErrSkip(t *testing.T) {
+	r, tracer := newRecorder()
+	h := Trace(func(_ context.Context, _ *natsio.Msg) error {
+		return hirnok.ErrSkip
+	}, tracer)
+
+	m := &natsio.Msg{Subject: testSubject, Data: []byte("b")}
+	if err := h(context.Background(), m); !errors.Is(err, hirnok.ErrSkip) {
+		t.Fatalf("err = %v, want ErrSkip", err)
+	}
+	spans := r.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	if spans[0].Status().Code == codes.Error {
+		t.Fatalf("ErrSkip should not mark span status as Error; got %v", spans[0].Status())
+	}
+
+	// Also verify nil tracer does not panic
+	hNilTracer := Trace(func(_ context.Context, _ *natsio.Msg) error { return nil }, nil)
+	if err := hNilTracer(context.Background(), m); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	hJetNilTracer := TraceJet(func(_ context.Context, _ jetstream.Msg) error { return nil }, nil)
+	if err := hJetNilTracer(context.Background(), &stubJSMsg{subject: testSubject}); err != nil {
+		t.Fatalf("unexpected err: %v", err)
 	}
 }
 

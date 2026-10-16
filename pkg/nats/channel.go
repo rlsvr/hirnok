@@ -15,6 +15,7 @@ import (
 type ChanSub[T any] struct {
 	ch        <-chan T
 	rawCh     chan T
+	done      chan struct{}
 	sub       *Sub
 	closeOnce sync.Once
 }
@@ -40,18 +41,30 @@ func (s *ChanSub[T]) Unsubscribe() error {
 // Drain stops accepting new messages, flushes remaining queued items into the
 // channel, waits for workers to finish, and closes the channel.
 func (s *ChanSub[T]) Drain(ctx context.Context) error {
-	return s.sub.Drain(ctx)
+	if err := s.sub.Drain(ctx); err != nil {
+		return err
+	}
+	return s.Wait(ctx)
 }
 
 // Wait blocks until all worker goroutines have exited and the channel has closed,
 // or until ctx is cancelled.
 func (s *ChanSub[T]) Wait(ctx context.Context) error {
-	return s.sub.Wait(ctx)
+	if err := s.sub.Wait(ctx); err != nil {
+		return err
+	}
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-// Stopped returns a channel that is closed when all workers have exited.
+// Stopped returns a channel that is closed when all workers have exited and
+// the message channel has been closed.
 func (s *ChanSub[T]) Stopped() <-chan struct{} {
-	return s.sub.Stopped()
+	return s.done
 }
 
 // SubscribeChan subscribes to subject and streams raw *natsio.Msg messages into
@@ -121,10 +134,16 @@ func SubscribeChanTransform[T any](
 		bufferSize = 64
 	}
 
-	rawCh := make(chan T, bufferSize)
+	combinedOpts := make([]Option, 0, 2+len(opts))
+	combinedOpts = append(combinedOpts, WithWorkers(1), WithQueueSize(bufferSize))
+	combinedOpts = append(combinedOpts, opts...)
+	run := conn.cfg.runOptions(combinedOpts)
+
+	rawCh := make(chan T, run.queueSize)
 	cs := &ChanSub[T]{
 		ch:    rawCh,
 		rawCh: rawCh,
+		done:  make(chan struct{}),
 	}
 
 	handler := func(hCtx context.Context, m *natsio.Msg) error {
@@ -140,13 +159,10 @@ func SubscribeChanTransform[T any](
 		}
 	}
 
-	combinedOpts := make([]Option, 0, 2+len(opts))
-	combinedOpts = append(combinedOpts, WithWorkers(1), WithQueueSize(bufferSize))
-	combinedOpts = append(combinedOpts, opts...)
-
 	sub, err := conn.Subscribe(ctx, subject, handler, combinedOpts...)
 	if err != nil {
 		close(rawCh)
+		close(cs.done)
 		return nil, err
 	}
 	cs.sub = sub
@@ -155,6 +171,7 @@ func SubscribeChanTransform[T any](
 		<-sub.Stopped()
 		cs.closeOnce.Do(func() {
 			close(cs.rawCh)
+			close(cs.done)
 		})
 	}()
 

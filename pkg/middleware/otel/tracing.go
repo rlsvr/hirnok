@@ -2,6 +2,7 @@ package otel
 
 import (
 	"context"
+	"errors"
 
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -16,6 +17,7 @@ import (
 
 const (
 	spanNameHandle = "hirnok.handle"
+	tracerName     = "github.com/rlsvr/hirnok"
 
 	attrMessagingSystem      = "messaging.system"
 	attrMessagingOperation   = "messaging.operation.name"
@@ -31,7 +33,16 @@ const (
 // span continues the caller's trace. The new span is attached to ctx
 // and threaded into the handler. Handler errors are recorded on the
 // span (RecordError + Error status).
+//
+// Panics if h is nil. If tracer is nil, the global OpenTelemetry tracer
+// for hirnok is used.
 func Trace(h hirnok.Handler, tracer trace.Tracer) hirnok.Handler {
+	if h == nil {
+		panic("otel: Trace requires a non-nil handler")
+	}
+	if tracer == nil {
+		tracer = otelapi.Tracer(tracerName)
+	}
 	return func(ctx context.Context, m *natsio.Msg) error {
 		var header natsio.Header
 		if m != nil {
@@ -51,7 +62,7 @@ func Trace(h hirnok.Handler, tracer trace.Tracer) hirnok.Handler {
 		setMessagingAttrs(span, "process", subject, header.Get(headerNatsMsgID), bodySize)
 
 		err := h(spanCtx, m)
-		if err != nil {
+		if err != nil && !errors.Is(err, hirnok.ErrSkip) {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}
@@ -60,7 +71,16 @@ func Trace(h hirnok.Handler, tracer trace.Tracer) hirnok.Handler {
 }
 
 // TraceJet is the JetStream equivalent of Trace.
+//
+// Panics if h is nil. If tracer is nil, the global OpenTelemetry tracer
+// for hirnok is used.
 func TraceJet(h hirnok.JetHandler, tracer trace.Tracer) hirnok.JetHandler {
+	if h == nil {
+		panic("otel: TraceJet requires a non-nil handler")
+	}
+	if tracer == nil {
+		tracer = otelapi.Tracer(tracerName)
+	}
 	return func(ctx context.Context, m jetstream.Msg) error {
 		var header natsio.Header
 		if m != nil {
@@ -80,7 +100,7 @@ func TraceJet(h hirnok.JetHandler, tracer trace.Tracer) hirnok.JetHandler {
 		setMessagingAttrs(span, "process", subject, header.Get(headerNatsMsgID), bodySize)
 
 		err := h(spanCtx, m)
-		if err != nil {
+		if err != nil && !errors.Is(err, hirnok.ErrSkip) {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}

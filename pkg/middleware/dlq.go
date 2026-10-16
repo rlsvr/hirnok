@@ -17,9 +17,10 @@ import (
 // see why a payload landed in the dead-letter queue without digging
 // into logs.
 const (
-	HeaderDLQReason  = "Hirnok-DLQ-Reason"
-	HeaderDLQSubject = "Hirnok-DLQ-Subject"
-	HeaderDLQAt      = "Hirnok-DLQ-At"
+	HeaderDLQReason    = "Hirnok-DLQ-Reason"
+	HeaderDLQSubject   = "Hirnok-DLQ-Subject"
+	HeaderDLQAt        = "Hirnok-DLQ-At"
+	HeaderDLQMessageID = "Hirnok-DLQ-Message-Id"
 
 	maxDLQReasonLen = 1024
 )
@@ -111,6 +112,10 @@ func DLQ(
 	opt := parseDLQOptions(opts)
 
 	return func(ctx context.Context, m *natsio.Msg) error {
+		origSubject := subjectOf(m)
+		if origSubject == subject {
+			return nil
+		}
 		err := h(ctx, m)
 		if err == nil {
 			return nil
@@ -130,7 +135,7 @@ func DLQ(
 			Data:    dataOf(m),
 			Header:  cloneHeader(headerOf(m)),
 		}
-		applyDLQHeaders(out.Header, err, subjectOf(m), opt)
+		applyDLQHeaders(out.Header, err, origSubject, opt)
 
 		if perr := conn.PublishMsg(out); perr != nil {
 			return dlqPublishError(err, subject, perr)
@@ -164,6 +169,10 @@ func DLQJet(
 	opt := parseDLQOptions(opts)
 
 	return func(ctx context.Context, m jetstream.Msg) error {
+		origSubject := jetSubjectOf(m)
+		if origSubject == subject {
+			return nil
+		}
 		err := h(ctx, m)
 		if err == nil {
 			return nil
@@ -183,7 +192,7 @@ func DLQJet(
 			Data:    jetDataOf(m),
 			Header:  cloneHeader(jetHeaderOf(m)),
 		}
-		applyDLQHeaders(out.Header, err, jetSubjectOf(m), opt)
+		applyDLQHeaders(out.Header, err, origSubject, opt)
 
 		if _, perr := js.PublishMsg(ctx, out); perr != nil {
 			return dlqPublishError(err, subject, perr)
@@ -240,8 +249,20 @@ func applyDLQHeaders(h natsio.Header, err error, origSubject string, opt dlqOpti
 }
 
 func cloneHeader(h natsio.Header) natsio.Header {
-	out := make(natsio.Header, len(h)+3) // +3 for the DLQ headers we'll add
+	out := make(natsio.Header, len(h)+4)
 	for k, v := range h {
+		switch k {
+		case jetstream.MsgIDHeader:
+			if len(v) > 0 && v[0] != "" {
+				out.Set(HeaderDLQMessageID, v[0])
+			}
+			continue
+		case jetstream.ExpectedStreamHeader,
+			jetstream.ExpectedLastSeqHeader,
+			jetstream.ExpectedLastSubjSeqHeader,
+			jetstream.ExpectedLastMsgIDHeader:
+			continue
+		}
 		out[k] = append(out[k], v...)
 	}
 	return out

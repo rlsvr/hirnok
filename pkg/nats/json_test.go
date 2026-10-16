@@ -275,3 +275,17 @@ func TestJetJSONHandler_NilHandlerPanics(t *testing.T) {
 	}()
 	_ = JetJSONHandler[samplePayload](nil)
 }
+
+func TestJSONHandler_DisallowUnknownFieldsRejectsTrailingData(t *testing.T) {
+	h := JSONHandler(func(_ context.Context, _ *natsio.Msg, _ samplePayload) error {
+		return nil
+	}, WithDisallowUnknownFields())
+
+	err := h(context.Background(), &natsio.Msg{Data: []byte(`{"id":"1","val":2} {"extra":true}`)})
+	if err == nil {
+		t.Fatal("expected error for trailing JSON data in DisallowUnknownFields mode")
+	}
+	if !errors.Is(err, ErrTerminate) {
+		t.Fatalf("expected ErrTerminate, got %v", err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	natsio "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -52,7 +53,17 @@ func decodeJSONPayload[T any](data []byte, payload *T, cfg JSONConfig) error {
 	if cfg.DisallowUnknown {
 		dec := json.NewDecoder(bytes.NewReader(data))
 		dec.DisallowUnknownFields()
-		return dec.Decode(payload)
+		if err := dec.Decode(payload); err != nil {
+			return err
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			if err == nil {
+				return errors.New("json: unexpected trailing data")
+			}
+			return err
+		}
+		return nil
 	}
 	return json.Unmarshal(data, payload)
 }

@@ -145,7 +145,7 @@ only what is specific to your consumer:
 
 ```go
 cfg := hirnok.DefaultConsumerConfig("orders-worker")
-cfg.FilterSubject = "orders.>"
+cfg.FilterSubject = "orders.created"
 
 cons, err := js.NewConsumer(ctx, "ORDERS", cfg, func(ctx context.Context, m jetstream.Msg) error {
     return processOrder(ctx, m.Data())

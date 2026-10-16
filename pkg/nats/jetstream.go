@@ -24,8 +24,8 @@ type JetStream struct {
 	cfg  Config
 }
 
-// JetStream returns a JetStream view of this connection. Cheap to call;
-// nats.go memoizes the underlying jetstream.JetStream per *natsio.Conn.
+// JetStream returns a JetStream view of this connection, inheriting QueueSize,
+// Workers, AckBuffer, and ErrorHandler defaults from the parent Conn.
 func (c *Conn) JetStream() (*JetStream, error) {
 	js, err := jetstream.New(c.nc)
 	if err != nil {
@@ -50,6 +50,7 @@ func DefaultConsumerConfig(durable string) jetstream.ConsumerConfig {
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		AckWait:       defaultAckWait,
+		MaxDeliver:    20,
 	}
 }
 
@@ -73,6 +74,7 @@ type Consumer struct {
 	cc           jetstream.ConsumeContext
 	q            *queue.Queue[queuedJetMsg]
 	cancel       context.CancelFunc
+	stopAfter    func() bool
 	pool         *worker.Pool
 	mu           sync.Mutex
 	closing      bool
@@ -87,8 +89,9 @@ type startJetConsumer func(func(jetstream.Msg)) (jetstream.ConsumeContext, error
 // worker pool. cfg is passed through to jetstream.ConsumerConfig: Durable,
 // FilterSubject, AckPolicy, DeliverPolicy, AckWait, etc. all live there.
 //
-// AckPolicy is forced to AckExplicitPolicy if unset (the wrapper relies on
-// it). AckWait defaults to 30s when zero.
+// AckPolicy defaults to AckExplicitPolicy when unset; non-explicit policies
+// (AckAllPolicy, AckNonePolicy) are rejected because per-message worker acks
+// depend on explicit acknowledgments. AckWait defaults to 30s when zero.
 func (j *JetStream) NewConsumer(
 	ctx context.Context,
 	stream string,
@@ -99,7 +102,15 @@ func (j *JetStream) NewConsumer(
 	if h == nil {
 		return nil, errors.New("nats: handler is required")
 	}
-	cfg = normalizeConsumerConfig(cfg)
+	run := j.cfg.runOptions(opts)
+	var err error
+	cfg, err = normalizeConsumerConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.MaxAckPending == 0 {
+		cfg.MaxAckPending = run.queueSize + run.workers
+	}
 
 	s, err := j.js.Stream(ctx, stream)
 	if err != nil {
@@ -110,7 +121,6 @@ func (j *JetStream) NewConsumer(
 		return nil, fmt.Errorf("upsert consumer: %w", err)
 	}
 
-	run := j.cfg.runOptions(opts)
 	return j.startConsumer(ctx, cfg, h, func(cb func(jetstream.Msg)) (jetstream.ConsumeContext, error) {
 		return cons.Consume(cb, jetstream.PullMaxMessages(run.queueSize+run.workers))
 	}, opts...)
@@ -121,8 +131,8 @@ func (j *JetStream) NewConsumer(
 // DeliverSubject and DeliverGroup when you need stable queue-style push
 // delivery; when DeliverSubject is empty, hirnok uses a generated inbox.
 //
-// AckPolicy is forced to AckExplicitPolicy if unset (the wrapper relies on
-// it). AckWait defaults to 30s when zero.
+// AckPolicy defaults to AckExplicitPolicy when unset; non-explicit policies
+// are rejected. AckWait defaults to 30s when zero.
 func (j *JetStream) NewPushConsumer(
 	ctx context.Context,
 	stream string,
@@ -133,7 +143,15 @@ func (j *JetStream) NewPushConsumer(
 	if h == nil {
 		return nil, errors.New("nats: handler is required")
 	}
-	cfg = normalizeConsumerConfig(cfg)
+	run := j.cfg.runOptions(opts)
+	var err error
+	cfg, err = normalizeConsumerConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.MaxAckPending == 0 {
+		cfg.MaxAckPending = run.queueSize + run.workers
+	}
 	if cfg.DeliverSubject == "" {
 		cfg.DeliverSubject = natsio.NewInbox()
 	}
@@ -166,14 +184,15 @@ func (j *JetStream) Consume(
 	return j.NewConsumer(ctx, stream, cfg, h, opts...)
 }
 
-func normalizeConsumerConfig(cfg jetstream.ConsumerConfig) jetstream.ConsumerConfig {
-	if cfg.AckPolicy == jetstream.AckPolicy(0) {
-		cfg.AckPolicy = jetstream.AckExplicitPolicy
+func normalizeConsumerConfig(cfg jetstream.ConsumerConfig) (jetstream.ConsumerConfig, error) {
+	if cfg.AckPolicy != jetstream.AckPolicy(0) && cfg.AckPolicy != jetstream.AckExplicitPolicy {
+		return cfg, fmt.Errorf("nats: unsupported AckPolicy %v (AckExplicitPolicy required)", cfg.AckPolicy)
 	}
+	cfg.AckPolicy = jetstream.AckExplicitPolicy
 	if cfg.AckWait == 0 {
 		cfg.AckWait = defaultAckWait
 	}
-	return cfg
+	return cfg, nil
 }
 
 func (j *JetStream) startConsumer(
@@ -193,10 +212,14 @@ func (j *JetStream) startConsumer(
 
 	cc, err := start(func(raw jetstream.Msg) {
 		dl := time.Now().Add(handlerTimeout)
-		_ = q.Push(consCtx, queuedJetMsg{
+		if pushErr := q.Push(consCtx, queuedJetMsg{
 			msg:      raw,
 			deadline: dl,
-		})
+		}); pushErr != nil {
+			if nakErr := raw.Nak(); nakErr != nil && run.errorHandler != nil {
+				run.errorHandler(nakErr)
+			}
+		}
 	})
 	if err != nil {
 		cancel()
@@ -205,13 +228,16 @@ func (j *JetStream) startConsumer(
 	}
 
 	pool := worker.Run(consCtx, run.workers, q, func(parent context.Context, item queuedJetMsg) {
-		if time.Now().After(item.deadline) {
+		if parent.Err() != nil || time.Now().After(item.deadline) {
 			if nakErr := item.msg.Nak(); nakErr != nil && run.errorHandler != nil {
 				run.errorHandler(nakErr)
 			}
 			return
 		}
-		DispatchJetWithDeadline(parent, h, item.msg, item.deadline, run.errorHandler)
+		if inProgErr := item.msg.InProgress(); inProgErr != nil && run.errorHandler != nil {
+			run.errorHandler(inProgErr)
+		}
+		DispatchJetWithDeadline(parent, h, item.msg, time.Now().Add(handlerTimeout), run.errorHandler)
 	})
 
 	consumer := &Consumer{
@@ -225,6 +251,11 @@ func (j *JetStream) startConsumer(
 	if j.conn != nil {
 		j.conn.registerConsumer(consumer)
 	}
+	consumer.mu.Lock()
+	consumer.stopAfter = context.AfterFunc(ctx, func() {
+		consumer.Stop()
+	})
+	consumer.mu.Unlock()
 	return consumer, nil
 }
 
@@ -314,6 +345,9 @@ func (c *Consumer) closeWithDrain(ctx context.Context, drain bool) error {
 	}
 	c.closing = true
 	c.closeDone = make(chan struct{})
+	if c.stopAfter != nil {
+		c.stopAfter()
+	}
 	c.mu.Unlock()
 
 	defer func() {

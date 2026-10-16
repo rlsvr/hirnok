@@ -653,3 +653,62 @@ func TestDLQ_ContextCanceledDoesNotPublish(t *testing.T) {
 		// Expected: nothing published
 	}
 }
+
+func TestDLQJet_StripsMsgIDAndPreventsSelfLoop(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL())
+	js, err := c.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	_, err = js.Raw().CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     "ORDERS_DLQ_TEST",
+		Subjects: []string{"orders.>"},
+	})
+	if err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+
+	var calls atomic.Int32
+	h := DLQJet(func(_ context.Context, _ jetstream.Msg) error {
+		calls.Add(1)
+		return fmt.Errorf("poison: %w", hirnok.ErrTerminate)
+	}, js, "orders.dlq", nil)
+
+	cfg := hirnok.DefaultConsumerConfig("orders-worker")
+	cfg.FilterSubject = "orders.>"
+	cons, err := js.NewConsumer(context.Background(), "ORDERS_DLQ_TEST", cfg, h)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	msg := natsio.NewMsg("orders.created")
+	msg.Data = []byte(`{"id":1}`)
+	msg.Header.Set(jetstream.MsgIDHeader, "dedupe-order-1")
+	msg.Header.Set(jetstream.ExpectedStreamHeader, "ORDERS_DLQ_TEST")
+	if _, err := js.PublishMsg(context.Background(), msg); err != nil {
+		t.Fatalf("publish msg: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1 (DLQ message must not trigger self-consumption loop)", got)
+	}
+
+	stream, err := js.Raw().Stream(context.Background(), "ORDERS_DLQ_TEST")
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	rawMsg, err := stream.GetLastMsgForSubject(context.Background(), "orders.dlq")
+	if err != nil {
+		t.Fatalf("expected DLQ message on orders.dlq (not deduplicated by Nats-Msg-Id): %v", err)
+	}
+	if got := rawMsg.Header.Get(HeaderDLQMessageID); got != "dedupe-order-1" {
+		t.Fatalf("%s = %q, want dedupe-order-1", HeaderDLQMessageID, got)
+	}
+	if got := rawMsg.Header.Get(jetstream.MsgIDHeader); got != "" {
+		t.Fatalf("expected %s to be stripped on DLQ message, got %q", jetstream.MsgIDHeader, got)
+	}
+}

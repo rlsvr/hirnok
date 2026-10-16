@@ -277,6 +277,9 @@ func TestNewConsumerRespectsContext(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker pool did not stop after ctx cancel")
 	}
+	waitFor(t, time.Second, func() bool {
+		return len(c.consumerList()) == 0
+	})
 }
 
 func TestNewConsumerFilterSubject(t *testing.T) {
@@ -1093,4 +1096,73 @@ func TestJetStream_WithErrorHandler(t *testing.T) {
 	defer cons.Stop()
 
 	time.Sleep(50 * time.Millisecond)
+}
+
+func TestNewConsumer_RejectsNonExplicitAckPolicy(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_ACKPOL", "ackpol.>")
+
+	for _, pol := range []jetstream.AckPolicy{jetstream.AckAllPolicy, jetstream.AckNonePolicy} {
+		_, err := j.NewConsumer(context.Background(), "S_ACKPOL", jetstream.ConsumerConfig{
+			Durable:       "c_ackpol",
+			FilterSubject: "ackpol.>",
+			AckPolicy:     pol,
+		}, func(_ context.Context, _ jetstream.Msg) error { return nil })
+		if err == nil {
+			t.Fatalf("expected NewConsumer to reject AckPolicy %v", pol)
+		}
+
+		_, err = j.NewPushConsumer(context.Background(), "S_ACKPOL", jetstream.ConsumerConfig{
+			Durable:       "c_ackpol_push",
+			FilterSubject: "ackpol.>",
+			AckPolicy:     pol,
+		}, func(_ context.Context, _ jetstream.Msg) error { return nil })
+		if err == nil {
+			t.Fatalf("expected NewPushConsumer to reject AckPolicy %v", pol)
+		}
+	}
+}
+
+func TestNewConsumer_InProgressPreventsQueueExpiryRedelivery(t *testing.T) {
+	s := runJSServer(t)
+	c := mustConnect(t, s.ClientURL(), Config{})
+	j := mustJetStream(t, c)
+	ensureStream(t, j, "S_INPROG", "inprog.>")
+
+	const total = 8
+	for i := range total {
+		if _, err := j.Publish(context.Background(), "inprog.x", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	var seen, redelivered atomic.Int32
+	cfg := DefaultConsumerConfig("c_inprog")
+	cfg.FilterSubject = "inprog.>"
+	cfg.AckWait = 500 * time.Millisecond
+
+	cons, err := j.NewConsumer(context.Background(), "S_INPROG", cfg, func(ctx context.Context, m jetstream.Msg) error {
+		md, _ := m.Metadata()
+		if md.NumDelivered > 1 {
+			redelivered.Add(1)
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+			seen.Add(1)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}, WithQueueSize(3), WithWorkers(1))
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer cons.Stop()
+
+	waitFor(t, 5*time.Second, func() bool { return seen.Load() == total })
+	if got := redelivered.Load(); got != 0 {
+		t.Fatalf("redelivered = %d, want 0", got)
+	}
 }
